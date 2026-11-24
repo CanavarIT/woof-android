@@ -1,0 +1,361 @@
+include(WoofSettings)
+
+set(WOOF_SOURCES
+    am_map.c               am_map.h
+    am_def.c
+    d_demoloop.c           d_demoloop.h
+                           d_englsh.h
+                           d_event.h
+    d_items.c              d_items.h
+    d_iwad.c               d_iwad.h
+    d_loop.c               d_loop.h
+    d_main.c               d_main.h
+    d_net.c                d_net.h
+                           d_player.h
+    d_rollback.c           d_rollback.h
+                           d_think.h
+                           d_ticcmd.h
+                           doomdata.h
+                           doomdef.h
+    doomstat.c             doomstat.h
+                           doomtype.h
+                           decl_defs.h
+    decl_main.c            decl_main.h
+    decl_props.c
+    decl_states.c
+    decl_sndinfo.c         decl_sndinfo.h
+    decl_sounds.c          decl_sounds.h
+    deh_ammo.c
+    deh_bex_helper.c
+    deh_bex_includes.c
+    deh_bex_music.c
+    deh_bex_partimes.c     deh_bex_partimes.h
+    deh_bex_pointers.c
+    deh_bex_sounds.c
+    deh_bex_sprites.c
+    deh_bex_strings.c
+    deh_cheat.c
+    deh_defs.h
+    deh_frame.c
+    deh_io.c               deh_io.h
+    deh_main.c             deh_main.h
+    deh_mapping.c          deh_mapping.h
+    deh_misc.c             deh_misc.h
+    deh_pointer.c
+    deh_sound.c
+    deh_strings.c          deh_strings.h
+    deh_text.c
+    deh_thing.c
+    deh_weapon.c
+    dsdh_main.c            dsdh_main.h
+    dsdh_mobjinfo.c
+    dsdh_sounds.c
+    dsdh_sprites.c
+    dsdh_states.c
+    f_finale.c             f_finale.h
+    f_wipe.c               f_wipe.h
+    g_compatibility.c      g_compatibility.h
+    g_game.c               g_game.h
+    g_input.c              g_input.h
+    g_nextweapon.c         g_nextweapon.h
+    g_rewind.c             g_rewind.h
+    g_skillinfo.c          g_skillinfo.h
+    g_umapinfo.c           g_umapinfo.h
+    hu_command.c           hu_command.h
+    hu_coordinates.c       hu_coordinates.h
+    hu_crosshair.c         hu_crosshair.h
+    hu_obituary.c          hu_obituary.h
+    i_3dsound.c
+    i_clapmusic.c
+    i_endoom.c             i_endoom.h
+    i_exit.c               i_exit.h
+    i_flickstick.c         i_flickstick.h
+    i_gamepad.c            i_gamepad.h
+    i_glob.c               i_glob.h
+    i_gyro.c               i_gyro.h
+    i_input.c              i_input.h
+    i_main.c
+    i_mbfsound.c
+    i_minimp3.c
+    i_nativemusic.c
+                           i_oalcommon.h
+    i_oalequalizer.c       i_oalequalizer.h
+    i_oalmusic.c
+    i_oalsound.c           i_oalsound.h
+                           i_oalstream.h
+    i_oplmusic.c
+    i_printf.c             i_printf.h
+    i_region.c             i_region.h
+    i_richpresence.c       i_richpresence.h
+    i_rumble.c             i_rumble.h
+                           i_sndfile.h
+    i_sound.c              i_sound.h
+    i_system.c             i_system.h
+    i_thread.c             i_thread.h
+    i_timer.c              i_timer.h
+    i_video.c              i_video.h
+    info.c                 info.h
+    kf_file.c
+    kf_memory.c
+    m_arena.c              m_arena.h
+    m_argv.c               m_argv.h
+    m_params.c             m_params.h
+    m_array.c              m_array.h
+    m_bbox.c               m_bbox.h
+    m_cheat.c              m_cheat.h
+    m_config.c             m_config.h
+    m_hashmap.c            m_hashmap.h
+                           m_fixed.h
+    m_input.c              m_input.h
+    m_io.c                 m_io.h
+    m_json.c               m_json.h
+    m_scanner.c            m_scanner.h
+    mn_container.c         mn_container.h
+                           mn_common.h
+    mn_csmenu.c            mn_csmenu.h
+    mn_csmenu_data.c
+    mn_font.c              mn_font.h
+    mn_menu.c              mn_menu.h
+    mn_multiplayer.c       mn_multiplayer.h
+    mn_multiplayer_data.c
+    mn_options.c           mn_options.h
+    mn_options_data.c
+    mn_saveload.c          mn_saveload.h
+    mn_snapshot.c          mn_snapshot.h
+    mp_start.c             mp_start.h
+    m_misc.c               m_misc.h
+    m_random.c             m_random.h
+                           m_swap.h
+                           m_vector.h
+    memio.c                memio.h
+    mididevice.c           mididevice.h
+    midifallback.c         midifallback.h
+    midifile.c             midifile.h
+    midiout.c              midiout.h
+    midiseq.c              midiseq.h
+    mus2mid.c              mus2mid.h
+    nano_bsp.c             nano_bsp.h
+    nw_client.c            nw_client.h
+    nw_common.c            nw_common.h
+    nw_dedicated.c         nw_dedicated.h
+                           nw_defs.h
+    nw_io.c                nw_io.h
+    nw_loop.c              nw_loop.h
+    nw_packet.c            nw_packet.h
+    nw_query.c             nw_query.h
+    nw_sdl.c               nw_sdl.h
+    nw_server.c            nw_server.h
+    nw_structrw.c          nw_structrw.h
+                           p_action.h
+    p_ambient.c            p_ambient.h
+    p_blockmap.c
+    p_bsp.c                p_bsp.h
+    p_ceilng.c
+    p_dirty.c              p_dirty.h
+    p_doors.c
+    p_enemy.c              p_enemy.h
+    p_floor.c
+    p_genlin.c
+    p_inter.c              p_inter.h
+    p_jump.c               p_jump.h
+                           p_keyframe.h
+    p_lights.c
+    p_map.c                p_map.h
+    p_maputl.c             p_maputl.h
+    p_mobj.c               p_mobj.h
+    p_overunder.c          p_overunder.h
+    p_plats.c
+    p_pspr.c               p_pspr.h
+    p_saveg.c              p_saveg.h
+    p_setup.c              p_setup.h
+    p_sight.c
+    p_spec.c               p_spec.h
+    p_switch.c
+    p_telept.c
+    p_tick.c               p_tick.h
+    p_udmf.c               p_udmf.h
+    p_user.c               p_user.h
+    r_bsp.c                r_bsp.h
+    r_common.c             r_common.h
+    r_data.c               r_data.h
+                           r_defs.h
+    r_draw.c               r_draw.h
+    r_main.c               r_main.h
+    r_plane.c              r_plane.h
+    r_segs.c               r_segs.h
+    r_sky.c                r_sky.h
+    r_skydefs.c            r_skydefs.h
+                           r_state.h
+    r_swirl.c              r_swirl.h
+    r_things.c             r_things.h
+    r_tranmap.c            r_tranmap.h
+    r_voxel.c              r_voxel.h
+    s_musinfo.c            s_musinfo.h
+    s_sound.c              s_sound.h
+    s_trakinfo.c           s_trakinfo.h
+    sounds.c               sounds.h
+    st_sbardef.c           st_sbardef.h
+    st_carousel.c          st_carousel.h
+    st_stuff.c             st_stuff.h
+    st_widgets.c           st_widgets.h
+    statdump.c             statdump.h
+    tables.c               tables.h
+    v_flextran.c           v_flextran.h
+    v_palette.c            v_palette.h
+    v_patch.c              v_patch.h
+                           v_srgb.h
+    v_trans.c              v_trans.h
+    v_video.c              v_video.h
+    w_wad.c                w_wad.h
+    w_common.c             w_common.h
+    w_file.c
+    w_zip.c
+    wi_stuff.c             wi_stuff.h
+    wi_interlvl.c          wi_interlvl.h
+    ws_stuff.c             ws_stuff.h
+    z_zone.c               z_zone.h
+)
+
+# Standard target definition
+add_executable(woof ${WOOF_SOURCES})
+target_woof_settings(woof)
+target_include_directories(woof PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/../")
+
+if(WIN32)
+    # Stamp out and compile resource file on Windows.
+    configure_file(resource.rc.in "${CMAKE_CURRENT_BINARY_DIR}/resource.rc")
+    target_sources(woof PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/resource.rc")
+
+    # MSVC tries to supply a default manifest and complains when it finds ours
+    # unless we specifically tell it not to.
+    if(MSVC)
+        target_link_options(
+            woof
+            PRIVATE "/MANIFEST:NO"
+            "$<IF:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>,/SUBSYSTEM:CONSOLE,/SUBSYSTEM:WINDOWS>"
+        )
+    else()
+        target_link_options(woof PRIVATE
+            "$<IF:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>,-mconsole,-mwindows>")
+    endif()
+endif()
+
+target_link_libraries(
+    woof
+    PRIVATE SDL3::SDL3
+            SDL3_net::SDL3_net
+            OpenAL::OpenAL
+            libebur128::libebur128
+            yyjson::yyjson
+            pffft::pffft
+            miniz::miniz
+            spng::spng
+            base64
+            md5
+            sha1
+            opl
+            textscreen
+            clap
+)
+
+target_include_directories(woof PRIVATE "${MINIMP3_INCLUDE_DIRS}/minimp3")
+
+# Some platforms require standard libraries to be linked against.
+if(HAVE_LIBM)
+    target_link_libraries(woof PRIVATE m)
+endif()
+
+if(HAVE_AL_BUFFER_CALLBACK)
+    target_sources(woof PRIVATE i_pcsound.c)
+endif()
+
+if(WIN32)
+    target_link_libraries(woof PRIVATE winmm shlwapi)
+endif()
+
+if(APPLE)
+    target_link_libraries(
+      woof
+      PRIVATE -Wl,-framework,AudioToolbox -Wl,-framework,AudioUnit
+              -Wl,-framework,CoreServices -Wl,-framework,CoreAudio
+              -Wl,-framework,CoreMIDI
+    )
+endif()
+
+# Fix static OpenAL Soft build
+get_target_property(OPENAL_DEFS OpenAL::OpenAL INTERFACE_COMPILE_DEFINITIONS)
+if(NOT WIN32 AND OPENAL_DEFS MATCHES "AL_LIBTYPE_STATIC")
+    target_link_libraries(woof PRIVATE c++)
+endif()
+
+if(HAVE_ALSA)
+    target_include_directories(woof PRIVATE ${ALSA_INCLUDE_DIR})
+    target_link_libraries(woof PRIVATE ALSA::ALSA)
+endif()
+
+if(HAVE_SNDFILE)
+    target_sources(woof PRIVATE i_sndfile.c)
+    target_link_libraries(woof PRIVATE SndFile::sndfile)
+endif()
+
+if(HAVE_FLUIDSYNTH)
+    target_sources(woof PRIVATE i_flmusic.c)
+    target_link_libraries(woof PRIVATE FluidSynth::libfluidsynth)
+endif()
+
+if(HAVE_LIBXMP)
+    target_sources(woof PRIVATE i_xmp.c)
+    target_link_libraries(woof PRIVATE libxmp::xmp)
+endif()
+
+if(HAVE_DISCORD_RPC)
+    target_link_libraries(woof PRIVATE DiscordRPC::discord-rpc)
+endif()
+
+target_compile_definitions(woof PRIVATE "THREADLOCAL=${WOOF_THREAD_LOCAL}")
+
+target_compile_definitions(woof PRIVATE
+    $<$<CONFIG:Debug,RelWithDebInfo>:RANGECHECK>)
+
+target_compile_definitions(woof PRIVATE
+    $<IF:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>,WOOF_DEBUG,WOOF_RELEASE>)
+
+# Optional features.
+#
+# Our defines are not namespaced, so we pass them at compile-time instead of
+# using config.h.
+if(WOOF_STRICT)
+    target_compile_definitions(woof PRIVATE MBF_STRICT)
+endif()
+
+# Base file
+add_dependencies(woof woof-base)
+
+if(MSVC OR APPLE)
+    add_custom_command(
+        TARGET woof
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "${BASE_PK3_PATH}"
+                "$<TARGET_FILE_DIR:woof>"
+    )
+endif()
+
+# Install
+#
+# Files to package in our distribution.
+if(WIN32)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 AND NOT VCPKG_TOOLCHAIN)
+        install(
+            TARGETS woof
+            RUNTIME_DEPENDENCIES
+                PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
+                POST_EXCLUDE_REGEXES ".*system32/.*\\.dll"
+                DIRECTORIES $<TARGET_FILE_DIR:woof> $ENV{PATH}
+            RUNTIME DESTINATION .
+        )
+    else()
+        install(TARGETS woof RUNTIME DESTINATION .)
+    endif()
+else()
+    install(TARGETS woof RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

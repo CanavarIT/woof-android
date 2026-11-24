@@ -1,0 +1,147 @@
+//
+//  Copyright(C) 2017 Christoph Oelckers
+//  Copyright(C) 2021 Roman Fomin
+//
+//  This program is free software; you can redistribute it and/or
+//  modify it under the terms of the GNU General Public License
+//  as published by the Free Software Foundation; either version 2
+//  of the License, or (at your option) any later version.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+
+#ifndef G_UMAPINFO_H
+#define G_UMAPINFO_H
+
+#include "doomtype.h"
+#include "d_player.h"
+#include "doomtype.h"
+#include "p_mobj.h"
+#include "r_defs.h"
+#include "wi_stuff.h"
+
+typedef enum MI_Finale_e
+{
+  EG_Clear = -1,
+  EG_None,
+  EG_Basic,
+  EG_ArtScreen,
+  EG_CastRollCall,
+  EG_BunnyScroll,
+  EG_CustomFinale,
+} MI_Finale_t;
+
+
+typedef enum
+{
+    MI_None,
+    MI_LabelClear           = (1u << 0),
+    MI_NoIntermission       = (1u << 1),
+    MI_InterTextClear       = (1u << 2),
+    MI_InterTextSecretClear = (1u << 3),
+    MI_BossActionClear      = (1u << 4),
+} MI_flags_t;
+
+typedef struct
+{
+    int type;
+    int special;
+    int tag;
+} MI_BossAction_t;
+
+typedef struct MI_Entry_s
+{
+    char *lumpname;
+    char *levelname;
+    char *label;
+    char *intertext;
+    char *intertextsecret;
+    char *author;
+    char levelpic[9];
+    char nextmap[9];
+    char nextsecret[9];
+    char music[9];
+    char skytexture[9];
+    char endpic[9];
+    char endfinale[9];
+    char exitpic[9];
+    char enterpic[9];
+    char exitanim[9];
+    char enteranim[9];
+    char interbackdrop[9];
+    char intermusic[9];
+    int partime;
+    MI_BossAction_t *bossactions;
+    MI_flags_t flags;
+    MI_Finale_t finale;
+} MI_Entry_t;
+
+extern MI_Entry_t *umapinfo;
+
+extern boolean EpiCustom;
+
+//
+// Abstract away map information calls
+//
+
+typedef enum MI_ShowNext_e
+{
+    WI_ShowNextNone,
+    WI_ShowNextLoc      = (1u << 0),
+    WI_ShowNextDone     = (1u << 1),
+    WI_ShowNextEpisodal = (1u << 2),
+} MI_ShowNext_t;
+
+typedef enum MI_Completion_e
+{
+    DC_None,
+    DC_Victory = (1u << 0),
+} MI_Completion_t;
+
+typedef enum MI_WinDisplay_e
+{
+    WD_None,
+    WD_Victory     = (1u << 0),
+    WD_StartFinale = (1u << 1),
+} MI_WinDisplay_t;
+
+// Parser
+void MI_ParseUniversalMapInfo(int lumpnum);
+
+// Slot handling
+MI_Entry_t *MI_MapEntry(int episode, int map);
+boolean MI_LumpName(const char *mapname, int *episode, int *map);
+boolean MI_IsSecretMap(int episode, int map);
+void MI_NextMap(int *episode, int *map);
+boolean MI_PreviousMap(int *episode, int *map);
+
+// Display data
+const char *MI_GetLevelTitle(void);
+const char *MI_GetLevelLabel(void);
+const char *MI_GetLevelAuthor(void);
+void MI_MapAnnouncement(char *announce_string, char *author_string,
+                        const char *string, size_t str_size);
+int MI_SkyTexture(void);
+void MI_ChangeMusic(void);
+
+// Death action
+boolean MI_BossAction(mobj_t *mo);
+void MI_SpecHits(int *speciallines);
+
+// Complete level
+void MI_UpdateLastMapInfo(wbstartstruct_t *wminfo);
+void MI_UpdateNextMapInfo(wbstartstruct_t *wminfo);
+void MI_UpdateGameMap(int epi, int map);
+void MI_VisitLevel(void);
+MI_Completion_t MI_PrepareIntermission(wbstartstruct_t *wminfo);
+MI_WinDisplay_t MI_PrepareFinale(void);
+
+// Intermission sequence
+void MI_WI_Start(wbstartstruct_t *wbs, const char **exitpic,
+                 const char **enterpic, wi_animation_t **animation);
+MI_ShowNext_t MI_ShowNextLoc(void);
+boolean MI_SkipShowNextLoc(void);
+
+#endif

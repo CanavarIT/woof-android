@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">Woof</string>
+    <string name="wads_folder_hint">WAD folder\n%1$s</string>
+    <string name="import_wad">Import WAD, PK3, DEH…</string>
+    <string name="no_iwad">No IWAD found. Import doom.wad, doom2.wad, freedoom1.wad or similar.</string>
+    <string name="iwad">Game</string>
+    <string name="addons">Add-ons</string>
+    <string name="addons_none">None</string>
+    <string name="choose_addons">Choose add-ons</string>
+    <string name="extra_args">Extra arguments, e.g. -warp 1 -skill 4</string>
+    <string name="play">Play</string>
+    <string name="imported">Imported %1$d file(s)</string>
+    <string name="error_pk3">Couldn\'t prepare woof.pk3: %1$s</string>
+    <string name="controls_title">Touch controls</string>
+    <string name="controls_summary">Move, resize and hide buttons</string>
+    <string name="editor_options">Options</string>
+    <string name="editor_reset">Reset</string>
+    <string name="editor_done">Done</string>
+    <string name="editor_hint">Drag a button to move it. Tap one to select it.</string>
+    <string name="editor_hide">%1$s selected. Tap here to hide it</string>
+    <string name="editor_show">%1$s is hidden. Tap here to show it</string>
+    <string name="opt_size">Button size</string>
+    <string name="opt_opacity">Opacity</string>
+    <string name="opt_look">Look sensitivity</string>
+</resources>

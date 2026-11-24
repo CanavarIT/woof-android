@@ -1,0 +1,1884 @@
+//
+//  Copyright (C) 1999 by
+//  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
+//
+//  This program is free software; you can redistribute it and/or
+//  modify it under the terms of the GNU General Public License
+//  as published by the Free Software Foundation; either version 2
+//  of the License, or (at your option) any later version.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+//
+//
+// DESCRIPTION:
+//  Refresh of things, i.e. objects represented by sprites.
+//
+//-----------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "d_player.h"
+#include "deh_strings.h"
+#include "doomdef.h"
+#include "doomstat.h"
+#include "doomtype.h"
+#include "hu_crosshair.h" // [Alaux] Lock crosshair on target
+#include "i_printf.h"
+#include "i_system.h"
+#include "i_thread.h"
+#include "i_video.h"
+#include "info.h"
+#include "m_bbox.h"
+#include "m_swap.h"
+#include "p_map.h"
+#include "p_maputl.h"
+#include "p_mobj.h"
+#include "p_pspr.h"
+#include "p_setup.h"
+#include "p_tick.h"
+#include "r_bsp.h"
+#include "r_draw.h"
+#include "r_main.h"
+#include "r_segs.h"
+#include "r_state.h"
+#include "r_things.h"
+#include "r_tranmap.h"
+#include "r_voxel.h"
+#include "tables.h"
+#include "v_patch.h"
+#include "v_trans.h"
+#include "v_video.h"
+#include "w_wad.h"
+#include "z_zone.h"
+
+#define MINZ        (FRACUNIT*4)
+#define MAXZ        (FRACUNIT*8192)
+#define BASEYCENTER 100
+
+typedef struct {
+  int x1;
+  int x2;
+  int column;
+  int topclip;
+  int bottomclip;
+} maskdraw_t;
+
+//
+// Sprite rotation 0 is facing the viewer,
+//  rotation 1 is one angle turn CLOCKWISE around the axis.
+// This is not the same as the angle,
+//  which increases counter clockwise (protractor).
+// There was a lot of stuff grabbed wrong, so I changed it...
+//
+
+fixed_t pspritescale,  pspriteyscale;
+fixed_t pspriteiscale, pspriteyiscale;
+
+// [Woof!] optimization for drawing huge amount of drawsegs.
+// adapted from prboom-plus/src/r_things.c
+typedef struct drawseg_xrange_item_s
+{
+  short x1, x2;
+  drawseg_t *user;
+} drawseg_xrange_item_t;
+
+typedef struct drawsegs_xrange_s
+{
+  drawseg_xrange_item_t *items;
+  int count;
+} drawsegs_xrange_t;
+
+#define DS_RANGES_COUNT 3
+// [MT] sprite clipping state is mutated while drawing, so everything from
+// here on is thread-local - each render context sorts and draws its own
+// vissprites against its own drawsegs.
+static THREADLOCAL drawsegs_xrange_t drawsegs_xranges[DS_RANGES_COUNT];
+
+static THREADLOCAL drawseg_xrange_item_t *drawsegs_xrange;
+static THREADLOCAL unsigned int drawsegs_xrange_size = 0;
+static THREADLOCAL int drawsegs_xrange_count = 0;
+
+// [FG] 32-bit integer math
+static THREADLOCAL int *clipbot = NULL; // killough 2/8/98: // dropoff overflow
+static THREADLOCAL int *cliptop = NULL; // change to MAX_*  // dropoff overflow
+
+// constant arrays
+//  used for psprite clipping and initializing clipping
+
+// [FG] 32-bit integer math
+int *negonearray = NULL;        // killough 2/8/98:
+int *screenheightarray = NULL;  // change to MAX_*
+
+//
+// INITIALIZATION FUNCTIONS
+//
+
+// variables used to look up and range check thing_t sprites patches
+
+spritedef_t *sprites;
+
+#define MAX_SPRITE_FRAMES 29          /* Macroized -- killough 1/25/98 */
+
+static spriteframe_t sprtemp[MAX_SPRITE_FRAMES];
+static int maxframe;
+
+void R_InitSpritesRes(void)
+{
+  xtoviewangle = Z_Calloc(video.width + 1, sizeof(*xtoviewangle), PU_RENDERER, NULL);
+  linearskyangle = Z_Calloc(video.width + 1, sizeof(*linearskyangle), PU_RENDERER, NULL);
+  negonearray = Z_Calloc(video.width, sizeof(*negonearray), PU_RENDERER, NULL);
+  screenheightarray = Z_Calloc(video.width, sizeof(*screenheightarray), PU_RENDERER, NULL);
+
+  // [MT] clipbot/cliptop moved to per-thread buffers, lazily allocated in
+  // R_ClearSprites().
+}
+
+//
+// R_InstallSpriteLump
+// Local function for R_InitSprites.
+//
+
+static void R_InstallSpriteLump(int lump, unsigned frame,
+                                unsigned rotation, boolean flipped)
+{
+  if (frame == '^' - 'A')
+  {
+    frame = '\\' - 'A';
+  }
+
+  if (frame >= MAX_SPRITE_FRAMES || rotation > 8)
+    I_Error("Bad frame characters in lump %i", lump);
+
+  if ((int) frame > maxframe)
+    maxframe = frame;
+
+  if (rotation == 0)
+    {    // the lump should be used for all rotations
+      int r;
+      for (r=0 ; r<8 ; r++)
+        if (sprtemp[frame].lump[r]==-1)
+          {
+            sprtemp[frame].lump[r] = lump - firstspritelump;
+            sprtemp[frame].flip[r] = (byte) flipped;
+            sprtemp[frame].rotate = false; //jff 4/24/98 if any subbed, rotless
+          }
+      return;
+    }
+
+  // the lump is only used for one rotation
+
+  if (sprtemp[frame].lump[--rotation] == -1)
+    {
+      sprtemp[frame].lump[rotation] = lump - firstspritelump;
+      sprtemp[frame].flip[rotation] = (byte) flipped;
+      sprtemp[frame].rotate = true; //jff 4/24/98 only change if rot used
+    }
+}
+
+//
+// R_InitSpriteDefs
+// Pass a null terminated list of sprite names
+// (4 chars exactly) to be used.
+//
+// Builds the sprite rotation matrixes to account
+// for horizontally flipped sprites.
+//
+// Will report an error if the lumps are inconsistent.
+// Only called at startup.
+//
+// Sprite lump names are 4 characters for the actor,
+//  a letter for the frame, and a number for the rotation.
+//
+// A sprite that is flippable will have an additional
+//  letter/number appended.
+//
+// The rotation character can be 0 to signify no rotations.
+//
+// 1/25/98, 1/31/98 killough : Rewritten for performance
+//
+// Empirically verified to have excellent hash
+// properties across standard Doom sprites:
+
+#define R_SpriteNameHash(s) ((unsigned)((s)[0]-((s)[1]*3-(s)[3]*2-(s)[2])*2))
+
+void R_InitSpriteDefs(char **namelist)
+{
+  size_t numentries = lastspritelump-firstspritelump+1;
+  struct { int index, next; } *hash;
+  int i;
+
+  if (!numentries || !*namelist)
+    return;
+
+  sprites = Z_Calloc(num_sprites, sizeof(*sprites), PU_STATIC, NULL);
+
+  // Create hash table based on just the first four letters of each sprite
+  // killough 1/31/98
+
+  hash = Z_Malloc(sizeof(*hash)*numentries,PU_STATIC,0); // allocate hash table
+
+  for (i=0; i<numentries; i++)             // initialize hash table as empty
+    hash[i].index = -1;
+
+  for (i=0; i<numentries; i++)             // Prepend each sprite to hash chain
+    {                                      // prepend so that later ones win
+      int j = R_SpriteNameHash(lumpinfo[i+firstspritelump].name) % numentries;
+      hash[i].next = hash[j].index;
+      hash[j].index = i;
+    }
+
+  // scan all the lump names for each of the names,
+  //  noting the highest frame letter.
+
+  for (i=0 ; i<num_sprites ; i++)
+    {
+      const char *spritename = namelist[i] ? DEH_String(namelist[i]) : namelist[i];
+      int j;
+
+      if (!spritename)
+        continue;
+
+      j = hash[R_SpriteNameHash(spritename) % numentries].index;
+
+      if (j >= 0)
+        {
+          memset(sprtemp, -1, sizeof(sprtemp));
+          maxframe = -1;
+          do
+            {
+              register lumpinfo_t *lump = lumpinfo + j + firstspritelump;
+
+              // Fast portable comparison -- killough
+              // (using int pointer cast is nonportable):
+
+              if (!((lump->name[0] ^ spritename[0]) |
+                    (lump->name[1] ^ spritename[1]) |
+                    (lump->name[2] ^ spritename[2]) |
+                    (lump->name[3] ^ spritename[3])))
+                {
+                  R_InstallSpriteLump(j+firstspritelump,
+                                      lump->name[4] - 'A',
+                                      lump->name[5] - '0',
+                                      false);
+                  if (lump->name[6])
+                    R_InstallSpriteLump(j+firstspritelump,
+                                        lump->name[6] - 'A',
+                                        lump->name[7] - '0',
+                                        true);
+                }
+            }
+          while ((j = hash[j].next) >= 0);
+
+          // check the frames that were found for completeness
+          if ((sprites[i].numframes = ++maxframe))  // killough 1/31/98
+            {
+              int frame;
+              for (frame = 0; frame < maxframe; frame++)
+                switch ((int) sprtemp[frame].rotate)
+                  {
+                  case -1:
+                    // no rotations were found for that frame at all
+                    // [FG] make non-fatal
+                    I_Printf (VB_WARNING, "R_InitSprites: No patches found "
+                             "for %.8s frame %c", namelist[i], frame+'A');
+                    break;
+
+                  case 0:
+                    // only the first rotation is needed
+                    break;
+
+                  case 1:
+                    // must have all 8 frames
+                    {
+                      int rotation;
+                      for (rotation=0 ; rotation<8 ; rotation++)
+                        if (sprtemp[frame].lump[rotation] == -1)
+                          I_Error ("Sprite %.8s frame %c is missing rotations",
+                                   namelist[i], frame+'A');
+                      break;
+                    }
+                  }
+              // allocate space for the frames present and copy sprtemp to it
+              sprites[i].spriteframes =
+                Z_Malloc (maxframe * sizeof(spriteframe_t), PU_STATIC, NULL);
+              memcpy (sprites[i].spriteframes, sprtemp,
+                      maxframe*sizeof(spriteframe_t));
+
+              // [MT] widest patch of this sprite (see spritedef_t::maxradius):
+              // the horizontal half-extent of the visual bounding box used to
+              // keep wide sprites projected in every render-context slab.
+              fixed_t maxradius = 0;
+              for (frame = 0; frame < maxframe; frame++)
+                for (int rot = 0; rot < 8; rot++)
+                  {
+                    const int l = sprtemp[frame].lump[rot];
+                    if (l < 0)
+                      continue;
+                    const fixed_t extent =
+                      MAX(spriteoffset[l], spritewidth[l] - spriteoffset[l]);
+                    if (extent > maxradius)
+                      maxradius = extent;
+                  }
+              sprites[i].maxradius = maxradius;
+            }
+        }
+    }
+  Z_Free(hash);             // free hash table
+}
+
+//
+// GAME FUNCTIONS
+//
+
+static THREADLOCAL vissprite_t *vissprites;   // killough
+static THREADLOCAL vissprite_t **vissprite_ptrs;
+static THREADLOCAL size_t num_vissprite, num_vissprite_alloc, num_vissprite_ptrs;
+
+#define M_ARRAY_INIT_CAPACITY 128
+#include "m_array.h"
+
+// [MT] each render thread collects its own nearby sprites during traversal.
+static THREADLOCAL mobj_t **nearby_sprites = NULL;
+
+// [MT] per-context list of mobjs that were rendered, for fast clearing of
+// mobj->rendered[] without iterating all thinkers.
+static THREADLOCAL mobj_t **rendered_things = NULL;
+static THREADLOCAL int rendered_things_count ;
+static THREADLOCAL int rendered_things_alloc;
+
+// [MT] per-context list of sectors visited during sprite collection, for
+// fast clearing of sector->rendervalidcount[] without iterating all sectors.
+// Frame scratch allocation like rendered_things; cleared at frame end.
+static THREADLOCAL sector_t **visited_sectors = NULL;
+static THREADLOCAL int visited_sectors_count;
+static THREADLOCAL int visited_sectors_alloc;
+
+//
+// R_InitSprites
+// Called at program start.
+//
+
+void R_InitSprites(char **namelist)
+{
+  int i;
+  for (i = 0; i < video.width; i++)    // killough 2/8/98
+    negonearray[i] = -1;
+  R_InitSpriteDefs(namelist);
+}
+
+//
+// R_ClearSprites
+// Called at frame start.
+//
+
+void R_ClearSprites (void)
+{
+  // [MT] per-frame clip buffers from the frame scratch allocator: no
+  // reallocs, freed wholesale at the next frame start.
+  clipbot = R_FrameScratchAlloc(2 * video.width * sizeof(*clipbot), 16);
+  cliptop = clipbot + video.width;
+
+  r_context->rendered_vissprites = num_vissprite; // [MT] per-context stat
+  num_vissprite = 0;            // killough
+  // [MT] vissprites/vissprite_ptrs/drawsegs_xranges live in grow-only
+  // malloc pools.
+}
+
+//
+// R_NewVisSprite
+//
+
+vissprite_t *R_NewVisSprite(void)
+{
+  if (num_vissprite >= num_vissprite_alloc)             // killough
+    {
+      num_vissprite_alloc = num_vissprite_alloc ? num_vissprite_alloc*2 : 128;
+      // [MT] plain realloc: worker threads must not use the zone allocator.
+      vissprites = I_Realloc(vissprites, num_vissprite_alloc * sizeof(*vissprites));
+    }
+ return vissprites + num_vissprite++;
+}
+
+//
+// R_DrawMaskedColumn
+// Used for sprites and masked mid textures.
+// Masked means: partly transparent, i.e. stored
+//  in posts/runs of opaque pixels.
+//
+
+THREADLOCAL int   *mfloorclip; // [FG] 32-bit integer math
+THREADLOCAL int   *mceilingclip; // [FG] 32-bit integer math
+THREADLOCAL fixed_t spryscale;
+THREADLOCAL int64_t sprtopscreen; // [FG] 64-bit integer math
+
+static THREADLOCAL boolean can_copy_column;
+static THREADLOCAL int copy_column_x;
+static THREADLOCAL int copy_column_yl, copy_column_yh;
+// [Alaux] Unclipped screen coordinates for last drawn column
+static THREADLOCAL int copy_column_uyl, copy_column_uyh;
+
+#define MAX_CACHED_POSTS 32
+
+static THREADLOCAL struct
+{
+  int yl, yh;
+} cached_posts[MAX_CACHED_POSTS];
+
+static THREADLOCAL int num_cached_posts = 0;
+
+// [Alaux]
+static boolean CopyLastColumn(void)
+{
+  // Column range
+  const int
+    cyl = MAX(copy_column_uyl, mceilingclip[dc_x] + 1),
+    cyh = MIN(copy_column_uyh, mfloorclip[dc_x]   - 1);
+
+  if (cyl < copy_column_yl || copy_column_yh < cyh)
+  {
+    // The target range exceeds the last drawn column's range
+    return false;
+  }
+
+  for (int i = 0; i < num_cached_posts; i++)
+  {
+    // Post range
+    const int
+      pyl = MAX(cached_posts[i].yl, cyl),
+      pyh = MIN(cached_posts[i].yh, cyh);
+
+    if (pyl <= pyh)
+    {
+      memcpy(
+        xlookup[dc_x] + rowofs[pyl],
+        xlookup[copy_column_x] + rowofs[pyl],
+        pyh - pyl + 1
+      );
+    }
+  }
+
+  return true;
+}
+
+void R_DrawMaskedColumn(column_t *column, boolean try_copy_column)
+{
+  int64_t topscreen, bottomscreen; // [FG] 64-bit integer math
+  fixed_t basetexturemid = dc_texturemid;
+  int top = -1;
+
+  dc_texheight = 0; // killough 11/98
+
+  num_cached_posts = 0;
+  copy_column_x = dc_x;
+
+  while (column->topdelta != 0xff)
+    {
+      // [FG] support for tall sprites in DeePsea format
+      if (column->topdelta <= top)
+      {
+        top += column->topdelta;
+      }
+      else
+      {
+        top = column->topdelta;
+      }
+
+      // calculate unclipped screen coordinates for post
+      topscreen = sprtopscreen + spryscale * top;
+      bottomscreen = topscreen + spryscale * column->length;
+
+      // Here's where "sparkles" come in -- killough:
+      dc_yl = (int) ((topscreen + FRACMASK) >> FRACBITS); // [FG] 64-bit integer math
+      dc_yh = (int) ((bottomscreen - 1) >> FRACBITS); // [FG] 64-bit integer math
+
+      const int uyl = dc_yl, uyh = dc_yh;
+
+      if (dc_yh >= mfloorclip[dc_x])
+        dc_yh = mfloorclip[dc_x]-1;
+
+      if (dc_yl <= mceilingclip[dc_x])
+        dc_yl = mceilingclip[dc_x]+1;
+
+      if (try_copy_column)
+      {
+        if (!num_cached_posts)
+        {
+          copy_column_yl = cached_posts[0].yl = dc_yl;
+          copy_column_yh = cached_posts[0].yh = dc_yh;
+
+          copy_column_uyl = uyl;
+          copy_column_uyh = uyh;
+
+          num_cached_posts++;
+          can_copy_column = true;
+        }
+        else if (dc_yl - copy_column_yh <= 1)
+        {
+          // Contiguous posts; merge them
+
+          copy_column_yh = dc_yh;
+          copy_column_uyh = uyh;
+
+          cached_posts[num_cached_posts - 1].yh = dc_yh;
+        }
+        else
+        // Non-contiguous posts
+        if (num_cached_posts < MAX_CACHED_POSTS)
+        {
+          copy_column_yh = dc_yh;
+          copy_column_uyh = uyh;
+
+          cached_posts[num_cached_posts].yl = dc_yl;
+          cached_posts[num_cached_posts].yh = dc_yh;
+
+          num_cached_posts++;
+        }
+        else
+        {
+          // Too many posts; cancel the copy
+          try_copy_column = can_copy_column = false;
+        }
+      }
+
+      // killough 3/2/98, 3/27/98: Failsafe against overflow/crash:
+      if (dc_yl <= dc_yh && dc_yh < viewheight)
+        {
+          dc_source = (byte *) column + 3;
+          dc_texturemid = basetexturemid - (top<<FRACBITS);
+
+          // Drawn by either R_DrawColumn
+          //  or (SHADOW) R_DrawFuzzColumn.
+          colfunc();
+        }
+
+      column = (column_t *) ((byte *) column + column->length + 4);
+    }
+
+  dc_texturemid = basetexturemid;
+}
+
+//
+// R_DrawVisSprite
+//  mfloorclip and mceilingclip should also be set.
+//
+
+void R_DrawVisSprite(vissprite_t *vis, int x1, int x2)
+{
+  column_t *column;
+  int      texturecolumn;
+  fixed_t  frac;
+
+  // [MT] first column of this (slab-clipped) slice; the fuzz drawers use
+  // it to finish blocks that began to its left.
+  dc_x1 = vis->x1;
+  // [MT] PU_STATIC: all sprite lumps are pre-cached at startup
+  // (R_InitSpriteLumps), so this is a lock-free zone read during parallel
+  // rendering.
+  patch_t  *patch = V_CachePatchNum(vis->patch+firstspritelump, PU_STATIC);
+
+  // killough 4/11/98: rearrange and handle translucent sprites
+  // mixed with translucent/non-translucent 2s normals
+
+  if (!vis->colormap[0])   // NULL colormap = shadow draw
+  {
+    colfunc = R_DrawFuzzColumn;    // killough 3/14/98
+  }
+  else
+  {
+    dc_colormap = vis->colormap[0];
+
+    // [FG] colored blood and gibs
+    if (vis->mobjflags_extra & MFX_COLOREDBLOOD)
+    {
+      dc_translation = xlat[vis->color].lump;
+    }
+    else if (vis->mobjflags & MF_TRANSLATION)
+    {
+      dc_translation = translationtables - 256 +
+        ((vis->mobjflags & MF_TRANSLATION) >> (MF_TRANSSHIFT-8) );
+    }
+    else
+    {
+      dc_translation = NULL;
+    }
+
+    if (translucency && !(strictmode && demo_compatibility)
+        && vis->tranmap) // phares // ID24
+    {
+      tranmap = vis->tranmap;   // ID24
+    }
+    else
+    {
+      tranmap = NULL;
+    }
+
+    colfunc = (dc_translation && tranmap) ? R_DrawTRTLColumn
+            : (dc_translation)            ? R_DrawTranslatedColumn
+            : (tranmap)                   ? R_DrawTLColumn
+            :                               R_DrawColumn;
+  }
+
+  dc_iscale = vis->yiscale;
+  frac = vis->startfrac;
+  spryscale = vis->scale;
+  sprtopscreen = centeryfrac - FixedMul(vis->texturemid, vis->scale);
+
+  dc_texturemid = vis->texturemid;
+
+  // [Alaux] Try copying columns of opaque sprites with 20% or more repetition
+  const boolean try_copy_column =
+    dc_iscale <= FRACUNIT*5/6 && vis->colormap[0] && !tranmap;
+
+  int lastcolumn = -1;
+
+  for (dc_x=vis->x1 ; dc_x<=vis->x2 ; dc_x++, frac += vis->xiscale)
+    {
+      texturecolumn = frac>>FRACBITS;
+
+      if (texturecolumn < 0)
+        continue;
+      else if (texturecolumn >= SHORT(patch->width))
+        break;
+
+      if (try_copy_column && lastcolumn == texturecolumn && can_copy_column)
+      {
+        if (CopyLastColumn())
+        {
+          continue;
+        }
+      }
+
+      lastcolumn = texturecolumn;
+
+      column = (column_t *)((byte *) patch +
+                            LONG(patch->columnofs[texturecolumn]));
+
+      R_DrawMaskedColumn (column, try_copy_column);
+    }
+  colfunc = R_DrawColumn;         // killough 3/14/98
+}
+
+inline const lighttable_t *const GetThingTint(const mobj_t *const mo,
+                                              const sector_t *const s)
+{
+    const int32_t tint = (mo->tint >= 0) ? mo->tint : s->tint;
+    return (tint >= 0) ? colormaps[tint] : fullcolormap;
+}
+
+//
+// R_ProjectSprite
+// Generates a vissprite for a thing if it might be visible.
+//
+
+boolean flipcorpses = false;
+
+static void R_ProjectSprite(mobj_t* thing, int lightlevel_override)
+{
+  fixed_t   gzt;               // killough 3/27/98
+  fixed_t   tx, txc;
+  fixed_t   xscale;
+  int       x1;
+  int       x2;
+  spritedef_t   *sprdef;
+  spriteframe_t *sprframe;
+  int       lump;
+  vissprite_t *vis;
+  int heightsec;      // killough 3/27/98
+
+  // [FG] moved declarations here
+  fixed_t tr_x, tr_y, gxt, gyt, tz;
+  fixed_t interpx, interpy, interpz, interpangle;
+
+  // andrewj: voxel support
+  if (VX_ProjectVoxel(thing, lightlevel_override))
+      return;
+
+  // [AM] Interpolate between current and last position,
+  //      if prudent.
+  if (uncapped &&
+      // Don't interpolate if the mobj did something
+      // that would necessitate turning it off for a tic.
+      thing->interp == true &&
+      // Don't interpolate during a paused state.
+      leveltime > oldleveltime)
+  {
+      interpx = LerpFixed(thing->oldx, thing->x);
+      interpy = LerpFixed(thing->oldy, thing->y);
+      interpz = LerpFixed(thing->oldz, thing->z);
+      interpangle = LerpAngle(thing->oldangle, thing->angle);
+  }
+  else
+  {
+      interpx = thing->x;
+      interpy = thing->y;
+      interpz = thing->z;
+      interpangle = thing->angle;
+  }
+
+  // transform the origin point
+  tr_x = interpx - viewx;
+  tr_y = interpy - viewy;
+
+  gxt = FixedMul(tr_x,viewcos);
+  gyt = -FixedMul(tr_y,viewsin);
+
+  tz = gxt-gyt;
+
+  // thing is behind view plane?
+  if (tz < MINZ || tz > MAXZ)
+    return;
+
+  gxt = -FixedMul(tr_x,viewsin);
+  gyt = FixedMul(tr_y,viewcos);
+  tx = -(gyt+gxt);
+
+  // too far off the side?
+  if (abs(tx) / max_project_slope > tz)
+    return;
+
+  xscale = FixedDiv(projection, tz);
+
+  // decide which patch to use for sprite relative to player
+
+  if ((unsigned) thing->sprite >= num_sprites)
+    I_Error ("invalid sprite number %i", thing->sprite);
+
+  sprdef = &sprites[thing->sprite];
+
+  if ((thing->frame&FF_FRAMEMASK) >= sprdef->numframes)
+    I_Error ("invalid frame %i for sprite %s",
+             thing->frame & FF_FRAMEMASK, sprnames[thing->sprite]);
+
+  sprframe = &sprdef->spriteframes[thing->frame & FF_FRAMEMASK];
+
+  boolean flip = false;
+
+  // [crispy] randomly flip corpse, blood and death animation sprites
+  if (STRICTMODE(flipcorpses) &&
+      (thing->flags_extra & MFX_MIRROREDCORPSE) &&
+      !(thing->flags & MF_SHOOTABLE) &&
+      (thing->intflags & MIF_FLIP))
+  {
+    flip = !flip;
+  }
+
+  if (sprframe->rotate)
+    {
+      // choose a different rotation based on player view
+      angle_t ang = R_PointToAngle(interpx, interpy);
+      unsigned rot = (ang-interpangle+(unsigned)(ANG45/2)*9)>>29;
+
+      // [Alaux] Proper rotation for flipped things
+      if (flip)
+      {
+        rot = (8 - rot) & 7;
+      }
+
+      lump = sprframe->lump[rot];
+      flip ^= (boolean) sprframe->flip[rot];
+    }
+  else
+    {
+      // use single rotation for all views
+      lump = sprframe->lump[0];
+      flip ^= (boolean) sprframe->flip[0];
+    }
+
+  fixed_t yscale = xscale;
+
+  if (adjust_aspect)
+  {
+    yscale = FixedMul(yscale, video.aspect_v_factor);
+  }
+
+  txc = tx; // [FG] sprite center coordinate
+
+  // calculate edges of the shape
+  // [crispy] fix sprite offsets for mirrored sprites
+  tx -= flip ? spritewidth[lump] - spriteoffset[lump] : spriteoffset[lump];
+  x1 = (centerxfrac + FixedMul64(tx, xscale)) >>FRACBITS;
+
+    // off the right side?
+  if (x1 > viewwidth)
+    return;
+
+  // [Alaux] Calculate this early
+  // to check if the right edge of the sprite goes past the left one
+  const int vx1 = x1 < 0 ? 0 : x1;
+
+  tx +=  spritewidth[lump];
+  x2 = ((centerxfrac + FixedMul64(tx, xscale)) >> FRACBITS) - 1;
+
+    // off the left side
+    // [Alaux] Or past the left edge of the sprite
+  if (x2 < vx1)
+    return;
+
+  // [MT] Clip the sprite to this render context's column slab. Adjacent
+  // contexts project the same mobj independently and each draws only its
+  // own slice, so sprites crossing a slab boundary come out seamless.
+  const int cx1 = MAX(vx1, r_context->startcol);
+  int cx2 = (x2 >= viewwidth) ? viewwidth - 1 : x2;
+  cx2 = MIN(cx2, r_context->endcol - 1);
+
+  if (cx2 < cx1)
+    return;
+
+  gzt = interpz + spritetopoffset[lump];
+
+  // [Alaux] Calculate this early so we can perform height clipping
+  // using multiplications instead of divisions
+  const fixed_t yiscale = FixedDiv(FRACUNIT, yscale);
+
+  // killough 4/9/98: clip things which are out of view due to height
+  // [Alaux] Improved, thanks to JNechaevsky and pvictress
+  {
+    const fixed_t gz = gzt - spriteheight[lump];
+
+    const int64_t
+      view_top    = viewz + FixedMul64(centeryfrac, yiscale),
+      view_bottom = viewz - FixedMul64(bottomydeltafrac, yiscale);
+
+    if (gzt < view_bottom || view_top < gz)
+    {
+      return;
+    }
+  }
+
+  // killough 3/27/98: exclude things totally separated
+  // from the viewer, by either water or fake ceilings
+  // killough 4/11/98: improve sprite clipping for underwater/fake ceilings
+
+  heightsec = thing->subsector->sector->heightsec;
+
+  if (heightsec != -1)   // only clip things which are in special sectors
+    {
+      int phs = viewplayer->mo->subsector->sector->heightsec;
+      if (phs != -1 && viewz < sectors[phs].floorheight ?
+          interpz >= sectors[heightsec].floorheight :
+          gzt < sectors[heightsec].floorheight)
+        return;
+      if (phs != -1 && viewz > sectors[phs].ceilingheight ?
+          gzt < sectors[heightsec].ceilingheight &&
+          viewz >= sectors[heightsec].ceilingheight :
+          interpz >= sectors[heightsec].ceilingheight)
+        return;
+    }
+
+  thing->rendered[r_context->index] = 1;
+  R_TrackRenderedThing(thing);
+
+  // store information in a vissprite
+  vis = R_NewVisSprite ();
+
+  // killough 3/27/98: save sector for special clipping later
+  vis->heightsec = heightsec;
+
+  vis->voxel_index = -1;
+
+  vis->mobjflags = thing->flags;
+  vis->mobjflags2 = thing->flags2;
+  vis->mobjflags_extra = thing->flags_extra;
+  vis->scale = yscale;
+  vis->gx = interpx;
+  vis->gy = interpy;
+  vis->gz = interpz;
+  vis->gzt = gzt;                          // killough 3/27/98
+  vis->texturemid = gzt - viewz;
+  vis->x1 = cx1;
+  vis->x2 = cx2;
+  vis->color = thing->bloodcolor;
+
+  const fixed_t iscale = FixedDiv(FRACUNIT, xscale);
+
+  if (flip)
+    {
+      vis->startfrac = spritewidth[lump]-1;
+      vis->xiscale = -iscale;
+    }
+  else
+    {
+      vis->startfrac = 0;
+      vis->xiscale = iscale;
+    }
+
+  vis->yiscale = yiscale;
+
+  if (vis->x1 > x1)
+    vis->startfrac += vis->xiscale*(vis->x1-x1);
+  vis->patch = lump;
+
+  const lighttable_t * const thiscolormap = GetThingTint(thing, thing->subsector->sector);
+
+  // get light level
+  if (thing->flags & MF_SHADOW)
+  {
+    // shadow draw
+    vis->colormap[0] = NULL;
+  }
+  else if (fixedcolormapoffset)
+  {
+    // fixed map
+    vis->colormap[0] = thiscolormap + fixedcolormapoffset;
+  }
+  else if (thing->frame & FF_FULLBRIGHT)
+  {
+    // full bright
+    // killough 3/20/98
+    vis->colormap[0] = thiscolormap;
+  }
+  else
+  {
+    // diminished light
+
+    int lightnum = comp[comp_thingsectorlight]
+                 ? lightlevel_override
+                 : thing->subsector->sector->lightlevel;
+
+    lightnum >>= LIGHTSEGSHIFT;
+    lightnum += extralight;
+    lightnum = CLAMP(lightnum, 0, LIGHTLEVELS - 1);
+
+    const int *const spritelightoffsets = scalelightoffset[lightnum];
+    const int index = R_GetLightIndex(vis->scale);
+
+    vis->colormap[0] = thiscolormap + spritelightoffsets[index];
+    vis->colormap[1] = thiscolormap;
+  }
+
+  // ID24 per-state tranmap
+  if (thing->state && thing->state->tranmap)
+  {
+    vis->tranmap = thing->state->tranmap;
+  }
+  else if (thing->tranmap)
+  {
+    vis->tranmap = thing->tranmap;
+  }
+  else if (thing->flags & MF_TRANSLUCENT && thing->state && thing->state->frame & FF_FULLBRIGHT)
+  {
+    vis->tranmap = main_addimap;
+  }
+  else if ((thing->flags & MF_TRANSLUCENT) || (thing->intflags & MIF_GHOST))
+  {
+    vis->tranmap = main_tranmap;
+  }
+  else
+  {
+    vis->tranmap = NULL;
+  }
+
+  // [Alaux] Lock crosshair on target
+  if (STRICTMODE(hud_crosshair_lockon) && thing == crosshair_target)
+  {
+    int x = (centerxfrac + FixedMul(txc, xscale)) >> FRACBITS;
+    int y = (centeryfrac + FixedMul(viewz - interpz - crosshair_target->actualheight / 2, yscale)) >> FRACBITS;
+    x = clampi(x, 0, viewwidth - 1);
+    y = clampi(y, 0, viewheight - 1);
+    HU_UpdateCrosshairLock(x, y);
+    crosshair_target = NULL; // Don't update it again until next tic
+  }
+}
+
+//
+// [MT] Wide-sprite sector association.
+//
+// Each render context culls the BSP subtrees that do not overlap its column
+// slab. A sprite whose own subsector lies in slab A but whose pixels reach
+// slab B is therefore never projected in B - and the nearby-sprite path misses
+// it too, because sec->touching_thinglist is built from the mobj's physical
+// radius (p_map.c: P_CreateSecNodeList), far smaller than the sprite itself.
+//
+// RNR handles this the same way: P_SortMobj() files each mobj under every
+// sector its sprite bounding box overlaps (radius = max(radius, sprite
+// maxradius)), and R_AddSprites() walks sec->sectormobjs. We cache the
+// overlapping sectors per mobj (mobj_t::overlapsec) and rebuild a per-frame
+// sector -> mobj index on the main thread before the contexts are dispatched.
+//
+
+static int *sectmobj_head = NULL;      // [numsectors], -1 = empty
+static int sectmobj_head_alloc;
+static mobj_t **sectmobj_thing = NULL; // link pool
+static int *sectmobj_next = NULL;
+static int sectmobj_count, sectmobj_alloc;
+
+static mobj_t *overlap_mobj;
+static fixed_t overlap_bbox[4];
+
+static void R_AddOverlap(sector_t *sec)
+{
+    mobj_t *mobj = overlap_mobj;
+    const int index = (int)(sec - sectors);
+
+    for (int i = 0; i < mobj->overlapcount; i++)
+    {
+        if (mobj->overlapsec[i] == index)
+        {
+            return;
+        }
+    }
+
+    if (mobj->overlapcount < MAX_SECTOR_OVERLAPS)
+    {
+        mobj->overlapsec[mobj->overlapcount++] = index;
+    }
+}
+
+static boolean PIT_Overlap(line_t *ld)
+{
+    if (overlap_bbox[BOXRIGHT] <= ld->bbox[BOXLEFT]
+        || overlap_bbox[BOXLEFT] >= ld->bbox[BOXRIGHT]
+        || overlap_bbox[BOXTOP] <= ld->bbox[BOXBOTTOM]
+        || overlap_bbox[BOXBOTTOM] >= ld->bbox[BOXTOP])
+    {
+        return true;
+    }
+
+    if (ld->frontsector)
+    {
+        R_AddOverlap(ld->frontsector);
+    }
+    if (ld->backsector && ld->backsector != ld->frontsector)
+    {
+        R_AddOverlap(ld->backsector);
+    }
+
+    return true;
+}
+
+static void R_CollectOverlaps(mobj_t *mobj)
+{
+    const fixed_t radius = sprites[mobj->sprite].maxradius;
+
+    mobj->overlapcount = 0;
+    overlap_mobj = mobj;
+    R_AddOverlap(mobj->subsector->sector);
+
+    overlap_bbox[BOXTOP] = mobj->y + radius;
+    overlap_bbox[BOXBOTTOM] = mobj->y - radius;
+    overlap_bbox[BOXRIGHT] = mobj->x + radius;
+    overlap_bbox[BOXLEFT] = mobj->x - radius;
+
+    validcount++; // P_BlockLinesIterator dedups lines by validcount
+
+    const int xl = (overlap_bbox[BOXLEFT] - bmaporgx) >> MAPBLOCKSHIFT;
+    const int xh = (overlap_bbox[BOXRIGHT] - bmaporgx) >> MAPBLOCKSHIFT;
+    const int yl = (overlap_bbox[BOXBOTTOM] - bmaporgy) >> MAPBLOCKSHIFT;
+    const int yh = (overlap_bbox[BOXTOP] - bmaporgy) >> MAPBLOCKSHIFT;
+
+    for (int bx = xl; bx <= xh; bx++)
+    {
+        for (int by = yl; by <= yh; by++)
+        {
+            P_BlockLinesIterator(bx, by, PIT_Overlap);
+        }
+    }
+}
+
+//
+// [MT] Sector -> wide-mobj index. Rebuilt once per tic from the thinker pass.
+//
+
+// Reset the index for the coming tic. Called from P_RunThinkers().
+void R_ClearSectMobjs(void)
+{
+    if (sectmobj_head_alloc < numsectors)
+    {
+        sectmobj_head = I_Realloc(sectmobj_head,
+                                  numsectors * sizeof(*sectmobj_head));
+        sectmobj_head_alloc = numsectors;
+    }
+    memset(sectmobj_head, -1, numsectors * sizeof(*sectmobj_head));
+
+    sectmobj_count = 0;
+}
+
+// [MT] File one mobj under the sectors its sprite bounding box overlaps, so a
+// wide sprite is still projected in a slab whose BSP traversal never reaches
+// its own subsector.
+void R_SortMobj(mobj_t *mobj)
+{
+    if ((unsigned)mobj->sprite >= (unsigned)num_sprites)
+    {
+        return;
+    }
+
+    // MF_NOSECTOR things live in nosectorthinglist; sec->thinglist never
+    // contains them, so neither should this index (they are invisible).
+    if (mobj->flags & MF_NOSECTOR)
+    {
+        return;
+    }
+
+    // Only sprites wider than the mobj's physical radius need this; the rest
+    // are already covered by sec->thinglist + sec->touching_thinglist.
+    if (sprites[mobj->sprite].maxradius <= mobj->radius)
+    {
+        return;
+    }
+
+    // Recollect only when the mobj moved or changed sprite (RNR keys this on
+    // prev/curr; we key on the last collected position/sprite).
+    if (mobj->overlapcount == 0 || mobj->overlapbox_sprite != mobj->sprite
+        || mobj->overlapbox_x != mobj->x || mobj->overlapbox_y != mobj->y)
+    {
+        R_CollectOverlaps(mobj);
+        mobj->overlapbox_sprite = mobj->sprite;
+        mobj->overlapbox_x = mobj->x;
+        mobj->overlapbox_y = mobj->y;
+    }
+
+    for (int k = 0; k < mobj->overlapcount; k++)
+    {
+        const int sec = mobj->overlapsec[k];
+
+        if (sectmobj_count >= sectmobj_alloc)
+        {
+            sectmobj_alloc = sectmobj_alloc ? sectmobj_alloc * 2 : 1024;
+            sectmobj_thing = I_Realloc(sectmobj_thing,
+                sectmobj_alloc * sizeof(*sectmobj_thing));
+            sectmobj_next = I_Realloc(sectmobj_next,
+                sectmobj_alloc * sizeof(*sectmobj_next));
+        }
+
+        sectmobj_thing[sectmobj_count] = mobj;
+        sectmobj_next[sectmobj_count] = sectmobj_head[sec];
+        sectmobj_head[sec] = sectmobj_count++;
+    }
+}
+
+//
+// R_AddSprites
+// During BSP traversal, this adds sprites by sector.
+//
+
+// killough 9/18/98: add lightlevel as parameter, fixing underwater lighting
+void R_AddSprites(sector_t* sec, int lightlevel_override)
+{
+  mobj_t *thing;
+
+  // BSP is traversed by subsector.
+  // A sector might have been split into several
+  //  subsectors during BSP building.
+  // Thus we check whether its already added.
+
+  // [MT] per-context flag (see rendervalidcount in r_defs.h): every render
+  // context adds the sector's things once for itself. The gameplay code keeps
+  // using sec->validcount/validcount untouched.
+  if (sec->rendervalidcount[r_context->index])
+    return;
+
+  // Well, now it will be done.
+  sec->rendervalidcount[r_context->index] = 1;
+  R_TrackVisitedSector(sec);
+
+  // Handle all things in sector.
+
+  for (thing = sec->thinglist; thing; thing = thing->snext)
+  {
+    if (!thing->rendered[r_context->index])
+      R_ProjectSprite(thing, lightlevel_override);
+  }
+
+  for (msecnode_t *n = sec->touching_thinglist; n; n = n->m_snext)
+  {
+    thing = n->m_thing;
+
+    // [FG] sprites in sector have already been projected
+    if (!thing->subsector->sector->rendervalidcount[r_context->index])
+    {
+      array_push(nearby_sprites, thing);
+    }
+  }
+  
+  if (sectmobj_head)
+  {
+    for (int link = sectmobj_head[(int)(sec - sectors)]; link != -1;
+         link = sectmobj_next[link])
+    {
+      thing = sectmobj_thing[link];
+
+      if (!thing->subsector->sector->rendervalidcount[r_context->index])
+      {
+        array_push(nearby_sprites, thing);
+      }
+    }
+  }
+}
+
+// Track a rendered mobj for fast clearing of mobj->rendered[] without iterating
+// all thinkers.
+void R_TrackRenderedThing(mobj_t *thing)
+{
+    if (rendered_things_count >= rendered_things_alloc)
+    {
+        int new_alloc = rendered_things_alloc ? rendered_things_alloc * 2 : 1024;
+        rendered_things = I_Realloc(rendered_things,
+                                    new_alloc * sizeof(*rendered_things));
+        rendered_things_alloc = new_alloc;
+    }
+    rendered_things[rendered_things_count++] = thing;
+}
+
+// Track a visited sector for fast clearing of sector->rendervalidcount[].
+void R_TrackVisitedSector(sector_t *sec)
+{
+    if (visited_sectors_count >= visited_sectors_alloc)
+    {
+        int new_alloc = visited_sectors_alloc ? visited_sectors_alloc * 2 : 512;
+        sector_t **new_array =  I_Realloc(visited_sectors, new_alloc * sizeof(*new_array));
+        visited_sectors = new_array;
+        visited_sectors_alloc = new_alloc;
+    }
+    visited_sectors[visited_sectors_count++] = sec;
+}
+
+// Clear sector->rendervalidcount[] for all tracked sectors in this context.
+void R_ClearVisitedSectors(void)
+{
+    for (int i = 0; i < visited_sectors_count; i++)
+    {
+        visited_sectors[i]->rendervalidcount[r_context->index] = 0;
+    }
+    visited_sectors_count = 0;
+}
+
+// Clear mobj->rendered[] for all tracked mobjs in this context.
+// Called after R_NearbySprites() but before automap early-return.
+void R_ClearTrackedRendered(void)
+{
+    for (int i = 0; i < rendered_things_count; i++)
+    {
+        rendered_things[i]->rendered[r_context->index] = 0;
+    }
+    rendered_things_count = 0;
+}
+
+void R_NearbySprites (void)
+{
+  for (int i = 0; i < array_size(nearby_sprites); i++)
+  {
+    mobj_t *thing = nearby_sprites[i];
+    sector_t* sec = thing->subsector->sector;
+    sector_t tempsec;
+    int floorlightlevel, ceilinglightlevel;
+
+    R_FakeFlat(sec, &tempsec, &floorlightlevel, &ceilinglightlevel, false);
+
+    // [FG] sprites in sector have already been projected
+    // [MT] the same mobj can be pushed from several touching sectors while its
+    // own sector stays unvisited, so the sector flag alone does not dedup it;
+    // also check the per-context mobj flag that R_ProjectSprite sets.
+    if (!sec->rendervalidcount[r_context->index]
+        && !thing->rendered[r_context->index]) // [MT]
+    {
+      R_ProjectSprite(thing, (floorlightlevel + ceilinglightlevel) / 2);
+    }
+  }
+
+  array_clear(nearby_sprites);
+}
+
+//
+// R_DrawPSprite
+//
+
+void R_DrawPSprite(pspdef_t *psp, int lightlevel_override)
+{
+  fixed_t       tx;
+  int           x1, x2;
+  spritedef_t   *sprdef;
+  spriteframe_t *sprframe;
+  int           lump;
+  boolean       flip;
+  vissprite_t   *vis;
+  vissprite_t   avis;
+
+  // decide which patch to use
+
+  if ((unsigned) psp->state->sprite >= num_sprites)
+    I_Error ("invalid sprite number %i", psp->state->sprite);
+
+  sprdef = &sprites[psp->state->sprite];
+
+  if ((psp->state->frame&FF_FRAMEMASK) >= sprdef->numframes)
+    I_Error ("invalid frame %i for sprite %s",
+             (int)(psp->state->frame & FF_FRAMEMASK),
+             sprnames[psp->state->sprite]);
+
+  sprframe = &sprdef->spriteframes[psp->state->frame & FF_FRAMEMASK];
+
+  lump = sprframe->lump[0];
+  flip = (boolean) sprframe->flip[0];
+
+  fixed_t sx2, sy2;
+
+  if (uncapped && oldleveltime < leveltime && psp_interp)
+  {
+    sx2 = LerpFixed(psp->oldsx2, psp->sx2);
+    sy2 = LerpFixed(psp->oldsy2, psp->sy2);
+  }
+  else
+  {
+    sx2 = psp->sx2;
+    sy2 = psp->sy2;
+  }
+
+  // calculate edges of the shape
+  tx = sx2 - 160*FRACUNIT; // [FG] centered weapon sprite
+
+  tx -= spriteoffset[lump];
+  x1 = (centerxfrac + FixedMul(tx, pspritescale)) >> FRACBITS;
+
+  // off the right side
+  if (x1 > viewwidth)
+    return;
+
+  tx += spritewidth[lump];
+  x2 = ((centerxfrac + FixedMul(tx, pspritescale)) >> FRACBITS) - 1;
+
+  // off the left side
+  if (x2 < 0)
+    return;
+
+  // [MT] Clip the weapon psprite to this render context's column slab; each
+  // context draws its own slice. ox1 keeps the unclipped left edge for the
+  // startfrac adjustment below.
+  const int ox1 = x1;
+  if (x1 < r_context->startcol)
+    x1 = r_context->startcol;
+  if (x2 >= r_context->endcol)
+    x2 = r_context->endcol - 1;
+  if (x2 < x1)
+    return;
+
+  // store information in a vissprite
+  vis = &avis;
+  vis->mobjflags = 0;
+  vis->mobjflags2 = 0;
+  vis->mobjflags_extra = 0;
+
+  // killough 12/98: fix psprite positioning problem
+  vis->texturemid = (BASEYCENTER<<FRACBITS) /* + FRACUNIT/2 */ -
+                    (sy2 - spritetopoffset[lump]); // [FG] centered weapon sprite
+
+  vis->x1 = x1 < 0 ? 0 : x1;
+  vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;
+  vis->scale = pspriteyscale;
+
+  if (flip)
+    {
+      vis->xiscale = -pspriteiscale;
+      vis->startfrac = spritewidth[lump]-1;
+    }
+  else
+    {
+      vis->xiscale = pspriteiscale;
+      vis->startfrac = 0;
+    }
+
+  vis->yiscale = pspriteyiscale;
+
+  // [MT] adjust against the unclipped left edge (ox1)
+  if (vis->x1 > ox1)
+    vis->startfrac += vis->xiscale*(vis->x1-ox1);
+
+  vis->patch = lump;
+
+  const lighttable_t * const thiscolormap =
+    GetThingTint(viewplayer->mo, viewplayer->mo->subsector->sector);
+
+  // killough 7/11/98: beta psprites did not draw shadows
+  if ((viewplayer->powers[pw_invisibility] > 4*32
+      || viewplayer->powers[pw_invisibility] & 8) && !beta_emulation)
+  {
+    // shadow draw
+    vis->colormap[0] = NULL;
+  }
+  else if (fixedcolormapoffset)
+  {
+    // fixed color
+    vis->colormap[0] = thiscolormap + fixedcolormapoffset;
+  }
+  else if (psp->state->frame & FF_FULLBRIGHT)
+  {
+    // full bright
+    // killough 3/20/98
+    vis->colormap[0] = thiscolormap;
+  }
+  else
+  {
+    // local light
+    int lightnum = comp[comp_thingsectorlight]
+                 ? lightlevel_override
+                 : viewplayer->mo->subsector->sector->lightlevel;
+
+    lightnum >>= LIGHTSEGSHIFT;
+    lightnum += extralight;
+    lightnum = CLAMP(lightnum, 0, LIGHTLEVELS - 1);
+
+    const int *const spritelightoffsets = scalelightoffset[lightnum];
+
+    vis->colormap[0] = thiscolormap + spritelightoffsets[MAXLIGHTSCALE - 1];
+    vis->colormap[1] = thiscolormap;
+  }
+
+  // ID24 per-state tranmap
+  if (psp->state && psp->state->tranmap)
+  {
+    vis->tranmap = psp->state->tranmap;
+  }
+  else if (viewplayer->mo->tranmap)
+  {
+    vis->tranmap = viewplayer->mo->tranmap;
+  }
+  else if (viewplayer->mo->flags & MF_TRANSLUCENT && psp->state->frame & FF_FULLBRIGHT)
+  {
+    vis->tranmap = main_addimap;
+  }
+  else if (viewplayer->mo->flags & MF_TRANSLUCENT /* || (thing->intflags & MIF_GHOST) */)
+  {
+    vis->tranmap = main_tranmap;
+  }
+  else
+  {
+    vis->tranmap = NULL;
+  }
+
+  // [crispy] free look
+  vis->texturemid += (centery - viewheight/2) * pspriteyiscale;
+
+  if (STRICTMODE(hide_weapon))
+    return;
+
+  R_DrawVisSprite(vis, vis->x1, vis->x2);
+}
+
+//
+// R_DrawPlayerSprites
+//
+
+void R_DrawPlayerSprites(void)
+{
+  int i;
+  pspdef_t *psp;
+  sector_t tmpsec;
+  int floorlightlevel, ceilinglightlevel;
+
+  // get light level
+  // killough 9/18/98: compute lightlevel from floor and ceiling lightlevels
+  // (see r_bsp.c for similar calculations for non-player sprites)
+
+  R_FakeFlat(viewplayer->mo->subsector->sector, &tmpsec,
+             &floorlightlevel, &ceilinglightlevel, 0);
+
+  // clip to screen bounds
+  mfloorclip = screenheightarray;
+  mceilingclip = negonearray;
+
+  // add all active psprites
+  for (i=0, psp=viewplayer->psprites; i<NUMPSPRITES; i++,psp++)
+    if (psp->state)
+      R_DrawPSprite(psp, ((floorlightlevel + ceilinglightlevel) / 2));
+}
+
+//
+// R_SortVisSprites
+//
+// Rewritten by Lee Killough to avoid using unnecessary
+// linked lists, and to use faster sorting algorithm.
+//
+
+#define bcopyp(d, s, n) memcpy(d, s, (n) * sizeof(void *))
+
+// killough 9/2/98: merge sort
+
+static void msort(vissprite_t **s, vissprite_t **t, int n)
+{
+  if (n >= 16)
+    {
+      int n1 = n/2, n2 = n - n1;
+      vissprite_t **s1 = s, **s2 = s + n1, **d = t;
+
+      msort(s1, t, n1);
+      msort(s2, t, n2);
+
+      while ((*s1)->scale >= (*s2)->scale ?
+             (*d++ = *s1++, --n1) : (*d++ = *s2++, --n2));
+
+      if (n2)
+        bcopyp(d, s2, n2);
+      else
+        bcopyp(d, s1, n1);
+
+      bcopyp(s, t, n);
+    }
+  else
+    {
+      int i;
+      for (i = 1; i < n; i++)
+        {
+          vissprite_t *temp = s[i];
+          if (s[i-1]->scale < temp->scale)
+            {
+              int j = i;
+              while ((s[j] = s[j-1])->scale < temp->scale && --j);
+              s[j] = temp;
+            }
+        }
+    }
+}
+
+void R_SortVisSprites (void)
+{
+  if (num_vissprite)
+    {
+      int i = num_vissprite;
+
+      // If we need to allocate more pointers for the vissprites,
+      // allocate as many as were allocated for sprites -- killough
+      // killough 9/22/98: allocate twice as many
+
+      if (num_vissprite_ptrs < num_vissprite*2)
+        {
+          // [MT] plain realloc: worker threads must not use the zone allocator.
+          vissprite_ptrs = I_Realloc(vissprite_ptrs,
+                                     (num_vissprite_ptrs = num_vissprite_alloc*2)
+                                     * sizeof *vissprite_ptrs);
+        }
+
+      // Sprites of equal distance need to be sorted in inverse order.
+      // This is most easily achieved by filling the sort array
+      // backwards before the sort.
+
+      while (--i>=0)
+        vissprite_ptrs[num_vissprite-i-1] = vissprites+i;
+
+      // killough 9/22/98: replace qsort with merge sort, since the keys
+      // are roughly in order to begin with, due to BSP rendering.
+
+      msort(vissprite_ptrs, vissprite_ptrs + num_vissprite, num_vissprite);
+    }
+}
+
+//
+// R_DrawSprite
+//
+
+void R_DrawSprite (vissprite_t* spr)
+{
+  drawseg_t *ds;
+  int     x;
+  int     r1;
+  int     r2;
+  fixed_t scale;
+  fixed_t lowscale;
+
+  for (x = spr->x1 ; x<=spr->x2 ; x++)
+    clipbot[x] = cliptop[x] = -2;
+
+  // Scan drawsegs from end to start for obscuring segs.
+  // The first drawseg that has a greater scale is the clip seg.
+
+  // Modified by Lee Killough:
+  // (pointer check was originally nonportable
+  // and buggy, by going past LEFT end of array):
+
+  //    for (ds=ds_p-1 ; ds >= drawsegs ; ds--)    old buggy code
+
+  // [Woof!] Andrey Budko: optimization
+  if (drawsegs_xrange_size)
+  {
+    const drawseg_xrange_item_t *last = &drawsegs_xrange[drawsegs_xrange_count - 1];
+    drawseg_xrange_item_t *curr = &drawsegs_xrange[-1];
+    while (++curr <= last)
+    {
+      // determine if the drawseg obscures the sprite
+      if (curr->x1 > spr->x2 || curr->x2 < spr->x1)
+        continue;      // does not cover sprite
+
+      ds = curr->user;
+
+      if (ds->scale1 > ds->scale2)
+        {
+          lowscale = ds->scale2;
+          scale = ds->scale1;
+        }
+      else
+        {
+          lowscale = ds->scale1;
+          scale = ds->scale2;
+        }
+
+      if (scale < spr->scale || (lowscale < spr->scale &&
+                    !R_PointOnSegSide (spr->gx, spr->gy, ds->curline)))
+      {
+        if (ds->maskedtexturecol)       // masked mid texture?
+        {
+          r1 = ds->x1 < spr->x1 ? spr->x1 : ds->x1;
+          r2 = ds->x2 > spr->x2 ? spr->x2 : ds->x2;
+          R_RenderMaskedSegRange(ds, r1, r2);
+        }
+        continue;               // seg is behind sprite
+      }
+
+      r1 = ds->x1 < spr->x1 ? spr->x1 : ds->x1;
+      r2 = ds->x2 > spr->x2 ? spr->x2 : ds->x2;
+
+      // clip this piece of the sprite
+      // killough 3/27/98: optimized and made much shorter
+
+      if (ds->silhouette&SIL_BOTTOM && spr->gz < ds->bsilheight) //bottom sil
+        for (x=r1 ; x<=r2 ; x++)
+          if (clipbot[x] == -2)
+            clipbot[x] = ds->sprbottomclip[x];
+
+      if (ds->silhouette&SIL_TOP && spr->gzt > ds->tsilheight)   // top sil
+        for (x=r1 ; x<=r2 ; x++)
+          if (cliptop[x] == -2)
+            cliptop[x] = ds->sprtopclip[x];
+    }
+  }
+
+  // killough 3/27/98:
+  // Clip the sprite against deep water and/or fake ceilings.
+  // killough 4/9/98: optimize by adding mh
+  // killough 4/11/98: improve sprite clipping for underwater/fake ceilings
+  // killough 11/98: fix disappearing sprites
+
+  if (spr->heightsec != -1)  // only things in specially marked sectors
+    {
+      fixed_t h,mh;
+      int phs = viewplayer->mo->subsector->sector->heightsec;
+      if ((mh = sectors[spr->heightsec].floorheight) > spr->gz &&
+          (h = centeryfrac - FixedMul(mh-=viewz, spr->scale)) >= 0 &&
+          (h >>= FRACBITS) < viewheight)
+      {
+        if (mh <= 0 || (phs != -1 && viewz > sectors[phs].floorheight))
+          {                          // clip bottom
+            for (x=spr->x1 ; x<=spr->x2 ; x++)
+              if (clipbot[x] == -2 || h < clipbot[x])
+                clipbot[x] = h;
+          }
+        else                        // clip top
+          if (phs != -1 && viewz <= sectors[phs].floorheight) // killough 11/98
+            for (x=spr->x1 ; x<=spr->x2 ; x++)
+              if (cliptop[x] == -2 || h > cliptop[x])
+                cliptop[x] = h;
+      }
+
+      if ((mh = sectors[spr->heightsec].ceilingheight) < spr->gzt &&
+          (h = centeryfrac - FixedMul(mh-viewz, spr->scale)) >= 0 &&
+          (h >>= FRACBITS) < viewheight)
+      {
+        if (phs != -1 && viewz >= sectors[phs].ceilingheight)
+          {                         // clip bottom
+            for (x=spr->x1 ; x<=spr->x2 ; x++)
+              if (clipbot[x] == -2 || h < clipbot[x])
+                clipbot[x] = h;
+          }
+        else                       // clip top
+          for (x=spr->x1 ; x<=spr->x2 ; x++)
+            if (cliptop[x] == -2 || h > cliptop[x])
+              cliptop[x] = h;
+      }
+    }
+  // killough 3/27/98: end special clipping for deep water / fake ceilings
+
+  // all clipping has been performed, so draw the sprite
+  // check for unclipped columns
+
+  for (x = spr->x1 ; x<=spr->x2 ; x++)
+    {
+      if (clipbot[x] == -2)
+        clipbot[x] = viewheight;
+
+      if (cliptop[x] == -2)
+        cliptop[x] = -1;
+    }
+
+  mfloorclip = clipbot;
+  mceilingclip = cliptop;
+
+  // andrewj: voxel support
+  if (spr->voxel_index >= 0)
+    VX_DrawVoxel (spr);
+  else
+    R_DrawVisSprite (spr, spr->x1, spr->x2);
+}
+
+//
+// R_DrawMasked
+//
+
+void R_DrawMasked(void)
+{
+  int i;
+  drawseg_t *ds;
+
+  R_SortVisSprites();
+
+  // [Woof!] Andrey Budko
+  // Reducing of cache misses in the following R_DrawSprite()
+  // Makes sense for scenes with huge amount of drawsegs.
+  // ~12% of speed improvement on epic.wad map05
+  for(i = 0; i < DS_RANGES_COUNT; i++)
+    drawsegs_xranges[i].count = 0;
+
+  if (num_vissprite > 0)
+  {
+    if (drawsegs_xrange_size < maxdrawsegs)
+    {
+      drawsegs_xrange_size = 2 * maxdrawsegs;
+      for(i = 0; i < DS_RANGES_COUNT; i++)
+      {
+        // [MT] plain realloc: worker threads must not use the zone allocator.
+        drawsegs_xranges[i].items = I_Realloc(
+          drawsegs_xranges[i].items,
+          drawsegs_xrange_size * sizeof(drawsegs_xranges[i].items[0]));
+      }
+    }
+    for (ds = ds_p; ds-- > drawsegs;)
+    {
+      if (ds->silhouette || ds->maskedtexturecol)
+      {
+        drawsegs_xranges[0].items[drawsegs_xranges[0].count].x1 = ds->x1;
+        drawsegs_xranges[0].items[drawsegs_xranges[0].count].x2 = ds->x2;
+        drawsegs_xranges[0].items[drawsegs_xranges[0].count].user = ds;
+
+        // Andrey Budko: ~13% of speed improvement on sunder.wad map10
+        if (ds->x1 < centerx)
+        {
+          drawsegs_xranges[1].items[drawsegs_xranges[1].count] =
+            drawsegs_xranges[0].items[drawsegs_xranges[0].count];
+          drawsegs_xranges[1].count++;
+        }
+        if (ds->x2 >= centerx)
+        {
+          drawsegs_xranges[2].items[drawsegs_xranges[2].count] =
+            drawsegs_xranges[0].items[drawsegs_xranges[0].count];
+          drawsegs_xranges[2].count++;
+        }
+
+        drawsegs_xranges[0].count++;
+      }
+    }
+  }
+
+  // draw all vissprites back to front
+
+  for (i = num_vissprite ;--i>=0; )
+  {
+    vissprite_t* spr = vissprite_ptrs[i];
+
+    if (spr->x2 < centerx)
+    {
+      drawsegs_xrange = drawsegs_xranges[1].items;
+      drawsegs_xrange_count = drawsegs_xranges[1].count;
+    }
+    else if (spr->x1 >= centerx)
+    {
+      drawsegs_xrange = drawsegs_xranges[2].items;
+      drawsegs_xrange_count = drawsegs_xranges[2].count;
+    }
+    else
+    {
+      drawsegs_xrange = drawsegs_xranges[0].items;
+      drawsegs_xrange_count = drawsegs_xranges[0].count;
+    }
+
+    R_DrawSprite(vissprite_ptrs[i]);         // killough
+  }
+
+  // render any remaining masked mid textures
+
+  // Modified by Lee Killough:
+  // (pointer check was originally nonportable
+  // and buggy, by going past LEFT end of array):
+
+  //    for (ds=ds_p-1 ; ds >= drawsegs ; ds--)    old buggy code
+
+  for (ds=ds_p ; ds-- > drawsegs ; )  // new -- killough
+    if (ds->maskedtexturecol)
+      R_RenderMaskedSegRange(ds, ds->x1, ds->x2);
+
+  // draw the psprites on top of everything
+  //  but does not draw on side views
+  if (!viewangleoffset)
+    R_DrawPlayerSprites ();
+}
+
+//----------------------------------------------------------------------------
+//
+// $Log: r_things.c,v $
+// Revision 1.22  1998/05/03  22:46:41  killough
+// beautification
+//
+// Revision 1.21  1998/05/01  15:26:50  killough
+// beautification
+//
+// Revision 1.20  1998/04/27  02:04:43  killough
+// Fix incorrect I_Error format string
+//
+// Revision 1.19  1998/04/24  11:03:26  jim
+// Fixed bug in sprites in PWAD
+//
+// Revision 1.18  1998/04/13  09:45:30  killough
+// Fix sprite clipping under fake ceilings
+//
+// Revision 1.17  1998/04/12  02:02:19  killough
+// Fix underwater sprite clipping, add wall translucency
+//
+// Revision 1.16  1998/04/09  13:18:48  killough
+// minor optimization, plus fix ghost sprites due to huge z-height diffs
+//
+// Revision 1.15  1998/03/31  19:15:27  killough
+// Fix underwater sprite clipping bug
+//
+// Revision 1.14  1998/03/28  18:15:29  killough
+// Add true deep water / fake ceiling sprite clipping
+//
+// Revision 1.13  1998/03/23  03:41:43  killough
+// Use 'fullcolormap' for fully-bright colormap
+//
+// Revision 1.12  1998/03/16  12:42:37  killough
+// Optimize away some function pointers
+//
+// Revision 1.11  1998/03/09  07:28:16  killough
+// Add primitive underwater support
+//
+// Revision 1.10  1998/03/02  11:48:59  killough
+// Add failsafe against texture mapping overflow crashes
+//
+// Revision 1.9  1998/02/23  04:55:52  killough
+// Remove some comments
+//
+// Revision 1.8  1998/02/20  22:53:22  phares
+// Moved TRANMAP initialization to w_wad.c
+//
+// Revision 1.7  1998/02/20  21:56:37  phares
+// Preliminarey sprite translucency
+//
+// Revision 1.6  1998/02/09  03:23:01  killough
+// Change array decl to use MAX screen width/height
+//
+// Revision 1.5  1998/02/02  13:32:49  killough
+// Performance tuning, program beautification
+//
+// Revision 1.4  1998/01/26  19:24:50  phares
+// First rev with no ^Ms
+//
+// Revision 1.3  1998/01/26  06:13:58  killough
+// Performance tuning
+//
+// Revision 1.2  1998/01/23  20:28:14  jim
+// Basic sprite/flat functionality in PWAD added
+//
+// Revision 1.1.1.1  1998/01/19  14:03:06  rand
+// Lee's Jan 19 sources
+//
+//----------------------------------------------------------------------------

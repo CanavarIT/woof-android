@@ -1,0 +1,222 @@
+//
+//  Copyright (C) 2022-2026 Fabian Greffrath
+//
+//  This program is free software; you can redistribute it and/or
+//  modify it under the terms of the GNU General Public License
+//  as published by the Free Software Foundation; either version 2
+//  of the License, or (at your option) any later version.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+//
+// DESCRIPTION:
+//      Savegame snapshots
+//
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "doomdef.h"
+#include "doomstat.h"
+#include "doomtype.h"
+#include "m_fixed.h"
+#include "r_main.h"
+#include "v_palette.h"
+#include "st_stuff.h"
+#include "v_video.h"
+
+#include "base64/base64.h"
+
+static const char snapshot_str[] = "WOOF_SNAPSHOT";
+static const int snapshot_len = arrlen(snapshot_str);
+static const int snapshot_size = (SCREENWIDTH * SCREENHEIGHT) * sizeof(pixel_t);
+
+// The menu shows a single snapshot at a time, so only one is kept loaded.
+static pixel_t *snapshot;
+static pixel_t *current_snapshot;
+
+const int MN_SnapshotDataSize(void)
+{
+    return snapshot_len + snapshot_size;
+}
+
+void MN_ResetSnapshot(void)
+{
+    if (snapshot)
+    {
+        free(snapshot);
+        snapshot = NULL;
+    }
+}
+
+// [FG] try to read snapshot data from the end of a savegame file
+
+boolean MN_ReadSnapshot(const byte *buf, int len, boolean decode)
+{
+    MN_ResetSnapshot();
+
+    if (buf == NULL || len <= 0)
+    {
+        return false;
+    }
+
+    // Check if base64-encoded or legacy
+    if (decode)
+    {
+        byte *str;
+
+        if ((snapshot = malloc(snapshot_size * sizeof(*snapshot))) == NULL)
+        {
+            return false;
+        }
+
+        size_t decoded_size;
+        if ((str = base64_decode(buf, len, &decoded_size)) == NULL)
+        {
+            return false;
+        }
+
+        if (decoded_size != snapshot_size)
+        {
+            free(str);
+            return false;
+        }
+
+        if (memcpy(snapshot, str, snapshot_size) == NULL)
+        {
+            free(str);
+            return false;
+        }
+
+        free(str);
+    }
+    else
+    {
+        const byte *str;
+
+        if ((str = buf + len - (snapshot_len + snapshot_size)) < buf)
+        {
+            return false;
+        }
+
+        if (strncasecmp((char *)str, snapshot_str, snapshot_len) != 0)
+        {
+            return false;
+        }
+
+        if ((snapshot = malloc(snapshot_size * sizeof(*snapshot))) == NULL)
+        {
+            return false;
+        }
+
+        if (memcpy(snapshot, str + snapshot_len, snapshot_size) == NULL)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// [FG] take a snapshot in SCREENWIDTH*SCREENHEIGHT resolution, i.e.
+//      in hires mode only only each second pixel in each second row is saved,
+//      in widescreen mode only the non-widescreen part in the middle is saved
+
+static void TakeSnapshot(void)
+{
+    int old_screenblocks = screenblocks;
+
+    screenblocks = ST_FullscreenStatusbar();
+    R_SetViewSize(screenblocks);
+    R_ExecuteSetViewSize();
+    R_RenderPlayerView(&players[displayplayer]);
+
+    if (!current_snapshot)
+    {
+        current_snapshot = malloc(snapshot_size * sizeof(*current_snapshot));
+    }
+
+    pixel_t *p = current_snapshot;
+    const pixel_t *s = I_VideoBuffer;
+
+    for (int x = video.deltaw; x < NONWIDEWIDTH + video.deltaw; x++)
+    {
+        const int line = V_ScaleX(x) * video.height;
+        pixel_t *p2 = p;
+
+        for (int y = 0; y < SCREENHEIGHT; y++)
+        {
+            *p2 = s[line + V_ScaleY(y)];
+            p2 += SCREENWIDTH;
+        }
+
+        p++;
+    }
+
+    R_SetViewSize(screenblocks = old_screenblocks);
+    R_ExecuteSetViewSize();
+}
+
+char *MN_WriteSnapshot(byte *p)
+{
+    TakeSnapshot();
+
+    // encode
+    if (p == NULL)
+    {
+         return (char*)base64_encode(current_snapshot, snapshot_size, NULL);
+    }
+
+    memcpy(p, snapshot_str, snapshot_len);
+    p += snapshot_len;
+
+    memcpy(p, current_snapshot, snapshot_size);
+
+    return NULL;
+}
+
+// [FG] draw the snapshot, if none is loaded
+//      fill the area with palette index 0 (i.e. mostly black)
+
+boolean MN_DrawSnapshot(int x, int y, int w, int h)
+{
+    if (!snapshot)
+    {
+        V_FillRect(x, y, w, h, playpal_global->black);
+        return false;
+    }
+
+    vrect_t rect;
+
+    rect.x = x;
+    rect.y = y;
+    rect.w = w;
+    rect.h = h;
+
+    V_ScaleRect(&rect);
+
+    const fixed_t step_x = (SCREENWIDTH << FRACBITS) / rect.sw;
+    const fixed_t step_y = (SCREENHEIGHT << FRACBITS) / rect.sh;
+
+    pixel_t *dest = I_VideoBuffer + (rect.sx * video.height) + rect.sy;
+
+    fixed_t srcx, srcy;
+    int destx, desty;
+    pixel_t *destcol, *srcline;
+
+    for (destx = 0, srcx = 0; destx < rect.sw; destx++, srcx += step_x)
+    {
+        destcol = dest + (destx * video.height);
+        srcline = snapshot + (srcx >> FRACBITS);
+
+        for (desty = 0, srcy = 0; desty < rect.sh; desty++, srcy += step_y)
+        {
+            *destcol++ = srcline[(srcy >> FRACBITS) * SCREENWIDTH];
+        }
+    }
+
+    return true;
+}

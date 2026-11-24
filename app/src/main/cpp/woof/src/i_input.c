@@ -1,0 +1,1115 @@
+//
+// Copyright(C) 2005-2014 Simon Howard
+// Copyright(C) 2023 Roman Fomin
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//
+
+#include <SDL3/SDL.h>
+
+#include <SDL3/SDL_joystick.h>
+#include <string.h>
+
+#include "d_event.h"
+#include "d_iwad.h"
+#include "d_main.h"
+#include "doomkeys.h"
+#include "doomstat.h"
+#include "doomtype.h"
+#include "i_exit.h"
+#include "i_gamepad.h"
+#include "i_gyro.h"
+#include "i_printf.h"
+#include "i_rumble.h"
+#include "i_timer.h"
+#include "i_video.h"
+#include "m_array.h"
+#include "m_config.h"
+#include "m_input.h"
+#include "m_io.h"
+#include "m_misc.h"
+#include "mn_options.h"
+#include "w_wad.h"
+
+#define AXIS_BUTTON_DEADZONE (SDL_JOYSTICK_AXIS_MAX / 3)
+
+static const char **gamepad_strings;
+static SDL_Gamepad *gamepad;
+static SDL_JoystickID gamepad_instance_id;
+static boolean gyro_supported;
+static joy_platform_t platform;
+
+// [FG] adapt joystick button and axis handling from Chocolate Doom 3.0
+
+int I_GetAxisState(SDL_GamepadAxis axis)
+{
+    return SDL_GetGamepadAxis(gamepad, axis);
+}
+
+static void AxisToButton(int value, int *state, int direction)
+{
+    int button = -1;
+
+    if (value < AXIS_BUTTON_DEADZONE && value > -AXIS_BUTTON_DEADZONE)
+    {
+        value = 0;
+    }
+
+    if (value < 0)
+    {
+        button = direction;
+    }
+    else if (value > 0)
+    {
+        button = direction + 1;
+    }
+
+    if (button != *state)
+    {
+        if (*state != -1)
+        {
+            static event_t up;
+            up.data1.i = *state;
+            up.type = ev_joyb_up;
+            D_PostEvent(&up);
+        }
+
+        if (button != -1)
+        {
+            static event_t down;
+            down.data1.i = button;
+            down.type = ev_joyb_down;
+            D_PostEvent(&down);
+        }
+
+        *state = button;
+    }
+}
+
+static int axisbuttons[] = {-1, -1, -1, -1};
+
+static void AxisToButtons(event_t *ev)
+{
+    AxisToButton(ev->data1.i, &axisbuttons[0], GAMEPAD_LEFT_STICK_LEFT);
+    AxisToButton(ev->data2.i, &axisbuttons[1], GAMEPAD_LEFT_STICK_UP);
+    AxisToButton(ev->data3.i, &axisbuttons[2], GAMEPAD_RIGHT_STICK_LEFT);
+    AxisToButton(ev->data4.i, &axisbuttons[3], GAMEPAD_RIGHT_STICK_UP);
+}
+
+static void TriggerToButton(int value, boolean *trigger_on, int trigger_type)
+{
+    static event_t ev;
+
+    if (value > trigger_threshold && !*trigger_on)
+    {
+        *trigger_on = true;
+        ev.type = ev_joyb_down;
+    }
+    else if (value <= trigger_threshold && *trigger_on)
+    {
+        *trigger_on = false;
+        ev.type = ev_joyb_up;
+    }
+    else
+    {
+        return;
+    }
+
+    ev.data1.i = trigger_type;
+    D_PostEvent(&ev);
+}
+
+static void TriggerToButtons(void)
+{
+    static boolean left_trigger_on;
+    static boolean right_trigger_on;
+
+    TriggerToButton(I_GetAxisState(SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
+                    &left_trigger_on, GAMEPAD_LEFT_TRIGGER);
+    TriggerToButton(I_GetAxisState(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER),
+                    &right_trigger_on, GAMEPAD_RIGHT_TRIGGER);
+}
+
+void I_ReadGyro(void)
+{
+    if (I_GyroEnabled() && gyro_supported)
+    {
+        static event_t ev = {.type = ev_gyro};
+        static float data[3];
+
+        SDL_GetGamepadSensorData(gamepad, SDL_SENSOR_ACCEL, data, 3);
+        data[0] /= SDL_STANDARD_GRAVITY;
+        data[1] /= SDL_STANDARD_GRAVITY;
+        data[2] /= SDL_STANDARD_GRAVITY;
+        I_UpdateAccelData(data);
+
+        SDL_GetGamepadSensorData(gamepad, SDL_SENSOR_GYRO, data, 3);
+        ev.data1.f = data[0];
+        ev.data2.f = data[1];
+        ev.data3.f = data[2];
+        D_PostEvent(&ev);
+    }
+}
+
+void I_UpdateGamepad(evtype_t type, boolean axis_buttons)
+{
+    static event_t ev;
+
+    ev.type = type;
+
+    if (I_UseStickLayout() || type == ev_joystick_state)
+    {
+        ev.data1.i = I_GetAxisState(SDL_GAMEPAD_AXIS_LEFTX);
+        ev.data2.i = I_GetAxisState(SDL_GAMEPAD_AXIS_LEFTY);
+        ev.data3.i = I_GetAxisState(SDL_GAMEPAD_AXIS_RIGHTX);
+        ev.data4.i = I_GetAxisState(SDL_GAMEPAD_AXIS_RIGHTY);
+        D_PostEvent(&ev);
+
+        if (axis_buttons)
+        {
+            AxisToButtons(&ev);
+        }
+    }
+
+    if (axis_buttons)
+    {
+        TriggerToButtons();
+    }
+}
+
+static void UpdateTouchState(boolean menu, boolean on)
+{
+    static event_t ev = {.data1.i = GAMEPAD_TOUCHPAD_TOUCH};
+    static int touch_time;
+
+    if (on)
+    {
+        if (menu)
+        {
+            touch_time = I_GetTimeMS();
+        }
+        else
+        {
+            ev.type = ev_joyb_down;
+            D_PostEvent(&ev);
+        }
+    }
+    else
+    {
+        if (menu)
+        {
+            // Allow separate "touch" and "press" bindings. Touch binding is
+            // registered after 100 ms to prevent accidental activation.
+            if (I_GetTimeMS() - touch_time > 100)
+            {
+
+                ev.type = ev_joyb_down;
+                D_PostEvent(&ev);
+                ev.type = ev_joyb_up;
+                D_PostEvent(&ev);
+            }
+        }
+        else
+        {
+            ev.type = ev_joyb_up;
+            D_PostEvent(&ev);
+        }
+    }
+}
+
+static void UpdateGamepadButtonState(unsigned int button, boolean on)
+{
+    static event_t event;
+    if (on)
+    {
+        event.type = ev_joyb_down;
+    }
+    else
+    {
+        event.type = ev_joyb_up;
+    }
+
+    event.data1.i = button;
+    D_PostEvent(&event);
+}
+
+boolean I_UseGamepad(void)
+{
+    return (gamepad != NULL);
+}
+
+boolean I_GyroSupported(void)
+{
+    return gyro_supported;
+}
+
+static joy_platform_t GetSwitchSubPlatform(void)
+{
+    if (gamepad != NULL)
+    {
+        switch (SDL_GetGamepadType(gamepad))
+        {
+            case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+                return PLATFORM_SWITCH_JOYCON_LEFT;
+
+            case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+                return PLATFORM_SWITCH_JOYCON_RIGHT;
+
+            case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+                return PLATFORM_SWITCH_JOYCON_PAIR;
+
+            default:
+                break;
+        }
+    }
+
+    return PLATFORM_SWITCH_PRO;
+}
+
+static void UpdatePlatform(void)
+{
+    platform = joy_platform;
+
+    if (platform == PLATFORM_AUTO)
+    {
+        if (gamepad != NULL)
+        {
+            switch ((int) SDL_GetGamepadType(gamepad))
+            {
+                case SDL_GAMEPAD_TYPE_XBOXONE:
+                    platform = PLATFORM_XBOXONE;
+                    break;
+
+                case SDL_GAMEPAD_TYPE_PS3:
+                    platform = PLATFORM_PS3;
+                    break;
+
+                case SDL_GAMEPAD_TYPE_PS4:
+                    platform = PLATFORM_PS4;
+                    break;
+
+                case SDL_GAMEPAD_TYPE_PS5:
+                    platform = PLATFORM_PS5;
+                    break;
+
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+                    platform = GetSwitchSubPlatform();
+                    break;
+            }
+        }
+    }
+    else if (platform == PLATFORM_SWITCH)
+    {
+        platform = GetSwitchSubPlatform();
+    }
+
+    M_UpdatePlatform(platform);
+}
+
+void I_FlushGamepadSensorEvents(void)
+{
+    SDL_PumpEvents();
+    SDL_FlushEvent(SDL_EVENT_GAMEPAD_SENSOR_UPDATE);
+}
+
+void I_FlushGamepadEvents(void)
+{
+    SDL_PumpEvents();
+    SDL_FlushEvent(SDL_EVENT_JOYSTICK_HAT_MOTION);
+    SDL_FlushEvent(SDL_EVENT_JOYSTICK_BUTTON_DOWN);
+    SDL_FlushEvent(SDL_EVENT_JOYSTICK_BUTTON_UP);
+    SDL_FlushEvent(SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+    SDL_FlushEvent(SDL_EVENT_GAMEPAD_BUTTON_UP);
+    SDL_FlushEvent(SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN);
+    SDL_FlushEvent(SDL_EVENT_GAMEPAD_TOUCHPAD_UP);
+    I_FlushGamepadSensorEvents();
+}
+
+void I_SetSensorEventState(boolean condition)
+{
+    if (I_GamepadEnabled())
+    {
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE,
+                            condition && gyro_supported);
+        I_FlushGamepadSensorEvents();
+    }
+}
+
+void I_SetSensorsEnabled(boolean condition)
+{
+    gyro_supported =
+        (gamepad && SDL_GamepadHasSensor(gamepad, SDL_SENSOR_ACCEL)
+         && SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO));
+
+    if (condition && gyro_supported)
+    {
+        SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL, true);
+        SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO, true);
+    }
+    else if (gamepad)
+    {
+        SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL, false);
+        SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO, false);
+    }
+
+    I_SetSensorEventState(condition && menuactive);
+}
+
+static void SetTouchEventState(boolean condition)
+{
+    if (condition && gamepad && SDL_GetNumGamepadTouchpads(gamepad) > 0)
+    {
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN, true);
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_TOUCHPAD_UP, true);
+    }
+    else
+    {
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN, false);
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_TOUCHPAD_UP, false);
+    }
+}
+
+static void EnableGamepadEvents(void)
+{
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_HAT_MOTION, true);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BUTTON_DOWN, true);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BUTTON_UP, true);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_DOWN, true);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_UP, true);
+    SetTouchEventState(true);
+    I_SetSensorsEnabled(I_GyroEnabled());
+}
+
+static void DisableGamepadEvents(void)
+{
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_HAT_MOTION, false);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BUTTON_DOWN, false);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BUTTON_UP, false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_DOWN, false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_UP, false);
+    SetTouchEventState(false);
+    I_SetSensorsEnabled(false);
+
+    // Always ignore unsupported gamepad events.
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_AXIS_MOTION, false);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BALL_MOTION, false);
+    SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_BATTERY_UPDATED, false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_AXIS_MOTION, false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_REMAPPED, false);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION, false);
+}
+
+static void I_ShutdownGamepad(void)
+{
+    I_ShutdownRumble();
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+}
+
+static int GetGamepadIndexFromID(SDL_JoystickID instance_id)
+{
+    int num_gamepads = 0;
+    SDL_JoystickID *instance_ids = SDL_GetGamepads(&num_gamepads);
+    int device_index = 0;
+
+    for (int i = 0; i < num_gamepads; i++)
+    {
+        if (instance_ids[i] == instance_id)
+        {
+            device_index = i;
+            break;
+        }
+    }
+
+    SDL_free(instance_ids);
+    return device_index;
+}
+
+static SDL_JoystickID GetGamepadIDFromIndex(int device_index)
+{
+    int num_gamepads = 0;
+    SDL_JoystickID *instance_ids = SDL_GetGamepads(&num_gamepads);
+    SDL_JoystickID instance_id = 0;
+
+    if (device_index >= 0 && device_index < num_gamepads)
+    {
+        instance_id = instance_ids[device_index];
+    }
+
+    SDL_free(instance_ids);
+    return instance_id;
+}
+
+static void AddMappings(void)
+{
+    int num_mappings = 0;
+    const char *filename =
+        M_StringJoin(D_DoomPrefDir(), DIR_SEPARATOR_S, "gamecontrollerdb.txt");
+
+    if (M_FileExistsNotDir(filename))
+    {
+        num_mappings = SDL_AddGamepadMappingsFromFile(filename);
+    }
+    else
+    {
+        const int lumpnum = W_CheckNumForLongName("gamecontrollerdb.txt");
+        if (lumpnum >= 0)
+        {
+            void *lump = W_CacheLumpNum(lumpnum, PU_STATIC);
+            const int lumplen = W_LumpLength(lumpnum);
+            SDL_IOStream *src = SDL_IOFromMem(lump, lumplen);
+            num_mappings = SDL_AddGamepadMappingsFromIO(src, true);
+            Z_Free(lump);
+        }
+    }
+
+    I_Printf(VB_DEBUG, "Loaded %d mappings from gamecontrollerdb.txt",
+             MAX(0, num_mappings));
+}
+
+void I_OpenGamepad(SDL_JoystickID instance_id);
+
+void I_InitGamepad(void)
+{
+    UpdatePlatform();
+
+    if (!I_GamepadEnabled())
+    {
+        return;
+    }
+
+    // Enable gyro, rumble, and effects on Bluetooth PlayStation controllers
+    // and gyro on Nintendo Switch controllers.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+
+    if (!SDL_Init(SDL_INIT_GAMEPAD))
+    {
+        I_Printf(VB_WARNING,
+                 "I_InitGamepad: Failed to initialize gamepad: %s",
+                 SDL_GetError());
+        return;
+    }
+
+    AddMappings();
+
+    DisableGamepadEvents();
+    I_InitRumble();
+
+    I_Printf(VB_INFO, "I_InitGamepad: Initialize gamepad.");
+
+    I_AtExit(I_ShutdownGamepad, true);
+
+    if (joy_device > 0)
+    {
+        int num_gamepads = 0;
+        SDL_JoystickID *instance_ids = SDL_GetGamepads(&num_gamepads);
+
+        if (joy_device <= num_gamepads)
+        {
+            I_OpenGamepad(instance_ids[joy_device - 1]);
+        }
+        else
+        {
+            joy_device = 1;
+
+            if (num_gamepads > 0)
+            {
+                I_OpenGamepad(instance_ids[0]);
+            }
+            else
+            {
+                MN_OptionsUpdateAllGamepadItems();
+            }
+        }
+
+        SDL_free(instance_ids);
+    }
+    else
+    {
+        MN_OptionsUpdateAllGamepadItems();
+    }
+
+    last_joy_device = joy_device;
+    SDL_FlushEvents(SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED);
+}
+
+static boolean CheckActiveGamepad(void)
+{
+    boolean active_gamepad = false;
+
+    if (gamepad_instance_id)
+    {
+        int num_gamepads = 0;
+        SDL_JoystickID *instance_ids = SDL_GetGamepads(&num_gamepads);
+
+        for (int i = 0; i < num_gamepads; i++)
+        {
+            if (instance_ids[i] == gamepad_instance_id)
+            {
+                joy_device = i + 1;
+                last_joy_device = joy_device;
+                MN_OptionsUpdateAllGamepadItems();
+                active_gamepad = true;
+                break;
+            }
+        }
+
+        SDL_free(instance_ids);
+    }
+
+    return active_gamepad;
+}
+
+static void CloseGamepad(void)
+{
+    if (gamepad_instance_id)
+    {
+        I_ResetAllRumbleChannels();
+        I_SetRumbleSupported(NULL);
+        SDL_CloseGamepad(gamepad);
+        gamepad = NULL;
+        gamepad_instance_id = 0;
+        joy_device = 0;
+        last_joy_device = joy_device;
+        DisableGamepadEvents();
+        UpdatePlatform();
+        I_ResetGamepad();
+    }
+}
+
+void I_OpenGamepad(SDL_JoystickID instance_id)
+{
+    if (CheckActiveGamepad())
+    {
+        // Ignore when already using a gamepad.
+        return;
+    }
+
+    CloseGamepad();
+    gamepad = SDL_OpenGamepad(instance_id);
+
+    if (gamepad)
+    {
+        I_Printf(VB_INFO, "I_OpenGamepad: Found a valid gamepad, named: %s",
+                 SDL_GetGamepadName(gamepad));
+
+        gamepad_instance_id = SDL_GetGamepadID(gamepad);
+        joy_device = GetGamepadIndexFromID(gamepad_instance_id) + 1;
+        last_joy_device = joy_device;
+        I_SetRumbleSupported(gamepad);
+        I_ResetAllRumbleChannels();
+        I_ResetGamepad();
+        UpdatePlatform();
+        EnableGamepadEvents();
+        SDL_SetGamepadPlayerIndex(gamepad, 0);
+
+        if (gyro_supported)
+        {
+            I_LoadGyroCalibration();
+        }
+    }
+    else
+    {
+        I_Printf(VB_ERROR, "I_OpenGamepad: Could not open gamepad: %s",
+                 SDL_GetError());
+    }
+
+    MN_OptionsUpdateAllGamepadItems();
+}
+
+void I_CloseGamepad(SDL_JoystickID instance_id)
+{
+    if (gamepad_instance_id)
+    {
+        if (instance_id == gamepad_instance_id)
+        {
+            CloseGamepad();
+            const SDL_JoystickID fallback_id = GetGamepadIDFromIndex(0);
+            if (fallback_id > 0)
+            {
+                // Fall back to another detected gamepad.
+                I_OpenGamepad(fallback_id);
+                return;
+            }
+        }
+        else if (CheckActiveGamepad())
+        {
+            // Ignore when already using a gamepad.
+            return;
+        }
+    }
+
+    MN_OptionsUpdateAllGamepadItems();
+}
+
+void I_UpdateGamepadDevice(boolean gamepad_input)
+{
+    if (gamepad_input && joy_device == 0)
+    {
+        // Prevent accidentally disabling gamepad when it's being used.
+        joy_device = last_joy_device;
+        return;
+    }
+
+    last_joy_device = joy_device;
+    const SDL_JoystickID selected_id = GetGamepadIDFromIndex(joy_device - 1);
+    CloseGamepad();
+
+    if (selected_id > 0)
+    {
+        I_OpenGamepad(selected_id);
+    }
+    else
+    {
+        MN_OptionsUpdateAllGamepadItems();
+    }
+}
+
+const char **I_GamepadDeviceList(void)
+{
+    joy_device = CLAMP(joy_device, 0, 255);
+    array_free(gamepad_strings);
+    array_push(gamepad_strings, "None");
+
+    if (!I_GamepadEnabled())
+    {
+        for (int i = 0; i < joy_device; i++)
+        {
+            array_push(gamepad_strings, "None");
+        }
+
+        return gamepad_strings;
+    }
+
+    int num_gamepads = 0;
+    SDL_JoystickID *instance_ids = SDL_GetGamepads(&num_gamepads);
+
+    for (int i = 0; i < num_gamepads; i++)
+    {
+        const char *name = SDL_GetGamepadNameForID(instance_ids[i]);
+        if (name)
+        {
+            char *dup_name = M_StringDuplicate(name);
+            array_push(gamepad_strings, dup_name);
+        }
+        else
+        {
+            array_push(gamepad_strings, "Unknown Device");
+        }
+    }
+
+    SDL_free(instance_ids);
+
+    for (int i = num_gamepads; i < joy_device; i++)
+    {
+        array_push(gamepad_strings, "None");
+    }
+
+    return gamepad_strings;
+}
+
+boolean I_GamepadDevices(void)
+{
+    return (array_size(gamepad_strings) > 1
+            && strncmp(gamepad_strings[1], "None", strlen(gamepad_strings[1])));
+}
+
+static float GetDeltaTime(const SDL_GamepadSensorEvent *csensor,
+                          uint64_t *last_time)
+{
+    const float dt = (csensor->sensor_timestamp - *last_time) * 1.0e-9f;
+    *last_time = csensor->sensor_timestamp;
+    return CLAMP(dt, 0.0f, 0.05f);
+}
+
+static void UpdateGyroState(const SDL_GamepadSensorEvent *csensor)
+{
+    static event_t ev = {.type = ev_gyro};
+    static uint64_t last_time;
+
+    ev.data1.f = csensor->data[0];
+    ev.data2.f = csensor->data[1];
+    ev.data3.f = csensor->data[2];
+    ev.data4.f = GetDeltaTime(csensor, &last_time);
+
+    D_PostEvent(&ev);
+}
+
+static void UpdateAccelState(const SDL_GamepadSensorEvent *csensor)
+{
+    static float data[3];
+    data[0] = csensor->data[0] / SDL_STANDARD_GRAVITY;
+    data[1] = csensor->data[1] / SDL_STANDARD_GRAVITY;
+    data[2] = csensor->data[2] / SDL_STANDARD_GRAVITY;
+
+    I_UpdateAccelData(data);
+}
+
+void I_HandleSensorEvent(SDL_Event *sdlevent)
+{
+    switch (sdlevent->gsensor.sensor)
+    {
+        case SDL_SENSOR_ACCEL:
+            UpdateAccelState(&sdlevent->gsensor);
+            break;
+
+        case SDL_SENSOR_GYRO:
+            UpdateGyroState(&sdlevent->gsensor);
+            break;
+
+        default:
+            break;
+    }
+}
+
+void I_HandleGamepadEvent(SDL_Event *sdlevent, boolean menu)
+{
+    switch (sdlevent->type)
+    {
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            UpdateGamepadButtonState(sdlevent->gbutton.button, true);
+            break;
+
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+            UpdateGamepadButtonState(sdlevent->gbutton.button, false);
+            break;
+
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+            UpdateTouchState(menu, true);
+            break;
+
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+            UpdateTouchState(menu, false);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// [FG] updated to scancode-based approach from Chocolate Doom 3.0
+
+static const int scancode_translate_table[] = SCANCODE_TO_KEYS_ARRAY;
+
+// If true, I_StartTextInput() has been called, and we are populating
+// the data3 field of ev_keydown events.
+
+static boolean text_input_enabled;
+
+static const char shiftxform[] = SHIFTXFORM_ARRAY;
+
+static boolean vanilla_keyboard_mapping;
+
+static int TranslateKey(SDL_Scancode scancode)
+{
+    switch (scancode)
+    {
+        case SDL_SCANCODE_LCTRL:
+        case SDL_SCANCODE_RCTRL:
+            return KEY_RCTRL;
+
+        case SDL_SCANCODE_LSHIFT:
+        case SDL_SCANCODE_RSHIFT:
+            return KEY_RSHIFT;
+
+        case SDL_SCANCODE_LALT:
+            return KEY_LALT;
+
+        case SDL_SCANCODE_RALT:
+            return KEY_RALT;
+
+        default:
+            if (scancode >= 0 && scancode < arrlen(scancode_translate_table))
+            {
+                return scancode_translate_table[scancode];
+            }
+            else
+            {
+                return 0;
+            }
+    }
+}
+
+
+// Get the localized version of the key press. This takes into account the
+// keyboard layout, but does not apply any changes due to modifiers, (eg.
+// shift-, alt-, etc.)
+
+static int GetLocalizedKey(SDL_KeyboardEvent *key)
+{
+    // When using Vanilla mapping, we just base everything off the scancode
+    // and always pretend the user is using a US layout keyboard.
+    if (vanilla_keyboard_mapping)
+    {
+        return TranslateKey(key->scancode);
+    }
+    else
+    {
+        int result = key->key;
+
+        if (result < 0 || result >= 128)
+        {
+            return 0;
+        }
+
+        return result;
+    }
+}
+
+static int GetTypedChar(SDL_Scancode scancode)
+{
+    int result = TranslateKey(scancode);
+
+    // If shift is held down, apply the original uppercase
+    // translation table used under DOS.
+    if ((SDL_GetModState() & SDL_KMOD_SHIFT) != 0 && result >= 0
+        && result < arrlen(shiftxform))
+    {
+        result = shiftxform[result];
+    }
+
+    return result;
+}
+
+void I_StartTextInput(void)
+{
+    text_input_enabled = true;
+
+    if (!vanilla_keyboard_mapping)
+    {
+        SDL_StartTextInput(I_GetSDLWindow());
+    }
+}
+
+void I_StopTextInput(void)
+{
+    text_input_enabled = false;
+
+    if (!vanilla_keyboard_mapping)
+    {
+        SDL_StopTextInput(I_GetSDLWindow());
+    }
+}
+
+static void UpdateMouseButtonState(unsigned int button, boolean on,
+                                   unsigned int dclick)
+{
+    static event_t event;
+
+    if (button < SDL_BUTTON_LEFT || button > NUM_MOUSE_BUTTONS)
+    {
+        return;
+    }
+
+    // Note: button "0" is left, button "1" is right,
+    // button "2" is middle for Doom.  This is different
+    // to how SDL sees things.
+
+    switch (button)
+    {
+        case SDL_BUTTON_LEFT:
+            button = 0;
+            break;
+
+        case SDL_BUTTON_RIGHT:
+            button = 1;
+            break;
+
+        case SDL_BUTTON_MIDDLE:
+            button = 2;
+            break;
+
+        default:
+            // SDL buttons are indexed from 1.
+            --button;
+            break;
+    }
+
+    // Turn bit representing this button on or off.
+
+    if (on)
+    {
+        event.type = ev_mouseb_down;
+    }
+    else
+    {
+        event.type = ev_mouseb_up;
+    }
+
+    // Post an event with the new button state.
+
+    event.data1.i = button;
+    event.data2.i = dclick;
+    D_PostEvent(&event);
+}
+
+static event_t delay_event;
+
+static void MapMouseWheelToButtons(SDL_MouseWheelEvent wheel)
+{
+    static event_t down;
+    int button;
+
+    if (wheel.y < 0)
+    {
+        button = MOUSE_BUTTON_WHEELDOWN;
+    }
+    else if (wheel.y > 0)
+    {
+        button = MOUSE_BUTTON_WHEELUP;
+    }
+    else if (wheel.x < 0)
+    {
+        button = MOUSE_BUTTON_WHEELLEFT;
+    }
+    else if (wheel.x > 0)
+    {
+        button = MOUSE_BUTTON_WHEELRIGHT;
+    }
+    else
+    {
+        return;
+    }
+
+    // post a button down event
+    down.type = ev_mouseb_down;
+    down.data1.i = button;
+    D_PostEvent(&down);
+
+    // hold button for one tic, required for checks in G_BuildTiccmd
+    delay_event.type = ev_mouseb_up;
+    delay_event.data1.i = button;
+}
+
+void I_DelayEvent(void)
+{
+    if (delay_event.data1.i)
+    {
+        D_PostEvent(&delay_event);
+        delay_event.data1.i = 0;
+    }
+}
+
+//
+// Read the change in mouse state to generate mouse motion events
+//
+
+void I_ReadMouse(void)
+{
+    static event_t ev = {.type = ev_mouse};
+
+    SDL_GetRelativeMouseState(&ev.data1.f, &ev.data2.f);
+
+    if (ev.data1.f || ev.data2.f)
+    {
+        D_PostEvent(&ev);
+        ev.data1.f = ev.data2.f = 0.0f;
+    }
+}
+
+void I_HandleMouseEvent(SDL_Event *sdlevent)
+{
+    switch (sdlevent->type)
+    {
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            UpdateMouseButtonState(sdlevent->button.button, true,
+                                   sdlevent->button.clicks);
+            break;
+
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            UpdateMouseButtonState(sdlevent->button.button, false, 0);
+            break;
+
+        case SDL_EVENT_MOUSE_WHEEL:
+            MapMouseWheelToButtons(sdlevent->wheel);
+            break;
+
+        default:
+            break;
+    }
+}
+
+void I_HandleKeyboardEvent(SDL_Event *sdlevent)
+{
+    static event_t event;
+
+    switch (sdlevent->type)
+    {
+        case SDL_EVENT_KEY_DOWN:
+            event.type = ev_keydown;
+            event.data1.i = TranslateKey(sdlevent->key.scancode);
+            event.data2.i = GetLocalizedKey(&sdlevent->key);
+
+            if (event.data1.i != 0)
+            {
+                D_PostEvent(&event);
+            }
+
+            if (text_input_enabled && vanilla_keyboard_mapping)
+            {
+                event.type = ev_text;
+                event.data1.i = GetTypedChar(sdlevent->key.scancode);
+
+                if (event.data1.i != 0)
+                {
+                    D_PostEvent(&event);
+                }
+            }
+            break;
+
+        case SDL_EVENT_KEY_UP:
+            event.type = ev_keyup;
+            event.data1.i = TranslateKey(sdlevent->key.scancode);
+
+            // data2 is initialized to zero for ev_keyup. For ev_keydown it's
+            // the shifted Unicode character that was typed, but if something
+            // wants to detect key releases it should do so based on data1
+            // (key ID), not the printable char.
+
+            event.data2.i = 0;
+
+            if (event.data1.i != 0)
+            {
+                D_PostEvent(&event);
+            }
+            break;
+
+        case SDL_EVENT_TEXT_INPUT:
+            // SDL_TEXTINPUT are fired only after SDL_StartTextInput().
+            if (strlen(sdlevent->text.text) == 1
+                && (sdlevent->text.text[0] & 0x80) == 0)
+            {
+                event.type = ev_text;
+                event.data1.i = sdlevent->text.text[0];
+                D_PostEvent(&event);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void I_InitKeyboard(void)
+{
+    // On desktop platforms, SDL_StartTextInput() is implicitly called on SDL
+    // window creation
+    SDL_StopTextInput(I_GetSDLWindow());
+}
+
+void I_BindKeyboardVariables(void)
+{
+    BIND_BOOL(vanilla_keyboard_mapping, false, "Vanilla keyboard mapping");
+}

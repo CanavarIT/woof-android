@@ -1,0 +1,2892 @@
+//
+//  Copyright (C) 1999 by
+//  id Software, Chi Hoang, Lee Killough, Jim Flynn, Rand Phares, Ty Halderman
+//  Copyright(C) 2020-2026 Fabian Greffrath
+//
+//  This program is free software; you can redistribute it and/or
+//  modify it under the terms of the GNU General Public License
+//  as published by the Free Software Foundation; either version 2
+//  of the License, or (at your option) any later version.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+//
+// DESCRIPTION:
+//  DOOM selection menu, options, episode etc. (aka Big Font menus)
+//  Sliders and icons. Kinda widget stuff.
+//  Setup Menus.
+//  Extended HELP screens.
+//  Dynamic HELP screen.
+//
+//-----------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "config.h"
+#include "d_event.h"
+#include "d_main.h"
+#include "deh_strings.h"
+#include "doomdef.h"
+#include "doomkeys.h"
+#include "doomstat.h"
+#include "doomtype.h"
+#include "g_game.h"
+#include "g_skillinfo.h"
+#include "g_umapinfo.h"
+#include "i_exit.h"
+#include "i_input.h"
+#include "i_printf.h"
+#include "i_system.h"
+#include "i_timer.h"
+#include "i_video.h"
+#include "m_input.h"
+#include "m_misc.h"
+#include "m_swap.h"
+#include "mn_font.h"
+#include "mn_container.h"
+#include "mn_csmenu.h"
+#include "mn_common.h"
+#include "mn_menu.h"
+#include "mn_options.h"
+#include "mn_saveload.h"
+#include "mp_start.h"
+#include "r_defs.h"
+#include "r_main.h"
+#include "s_sound.h"
+#include "sounds.h"
+#include "st_sbardef.h"
+#include "st_stuff.h"
+#include "st_widgets.h"
+#include "v_patch.h"
+#include "v_video.h"
+#include "w_wad.h"
+#include "wi_stuff.h"
+#include "z_zone.h"
+
+
+// [crispy] remove DOS reference from the game quit confirmation dialogs
+#ifndef _WIN32
+#  include <unistd.h> // [FG] isatty()
+#endif
+
+//
+// defaulted values
+//
+
+// Blocky mode, has default, 0 = high, 1 = normal
+// int     detailLevel;    obsolete -- killough
+int screenblocks, maxscreenblocks; // has default
+
+static int messageToPrint; // 1 = message to be printed
+
+static const char *messageString; // ...and here is the message string!
+
+static int messageLastMenuActive;
+
+static boolean messageNeedsInput; // timed message = no input from user
+
+static void (*messageRoutine)(int response);
+
+boolean menuactive; // The menus are up
+static boolean mouse_active_thermo;
+static boolean options_active;
+static boolean customskill_active;
+
+boolean menu_pause_demos;
+backdrop_t menu_backdrop;
+
+static int bigfont_priority = -1;
+
+#define SKULLXOFF        -32
+#define LINEHEIGHT       16
+
+#define M_THRM_STEP      8
+
+//
+// MENU TYPEDEFS
+//
+
+typedef enum
+{
+    MF_HILITE   = 0x00000001,
+    MF_THRM     = 0x00000002,
+    MF_THRM_STR = 0x00000004,
+    MF_OPTLUMP  = 0x00000010,
+} mflags_t;
+
+typedef enum
+{
+    CHOICE_LEFT  = -2,
+    CHOICE_RIGHT = -1,
+    CHOICE_VALUE = 0,
+} mchoice_t;
+
+// NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
+typedef struct
+{
+    short status; // 0 = no cursor here, 1 = ok, 2 = arrows ok
+    char name[9];
+
+    // choice = menu item #.
+    // if status = 2,
+    //   choice = CHOICE_LEFT:leftarrow, CHOICE_RIGHT:rightarrow
+    void (*routine)(int choice);
+    char alphaKey; // hotkey in menu
+    // [FG] alternative text for missing menu graphics lumps
+    const char *alttext;
+    mrect_t rect;
+    mflags_t flags;
+} menuitem_t;
+// NOLINTEND(clang-analyzer-optin.performance.Padding)
+
+typedef struct menu_s
+{
+    short numitems;          // # of menu items
+    struct menu_s *prevMenu; // previous menu
+    menuitem_t *menuitems;   // menu items
+    void (*routine)();       // draw routine
+    short x;
+    short y;           // x,y of menu
+    short lastOn;      // last item user was on in menu
+    int lumps_missing; // [FG] indicate missing menu graphics lumps
+} menu_t;
+
+static int highlight_item;
+static short itemOn;           // menu item skull is on (for Big Font menus)
+static short skullAnimCounter; // skull animation counter
+short whichSkull;              // which skull to draw (he blinks)
+
+// graphic name of skulls
+
+static char skullName[2][/*8*/ 9] = {"M_SKULL1", "M_SKULL2"};
+
+static menu_t *currentMenu; // current menudef
+
+// end of externs added for setup menus
+
+//
+// PROTOTYPES
+//
+static void M_NewGame(int choice);
+static void M_Episode(int choice);
+static void M_LoadGame(int choice);
+static void M_SaveGame(int choice);
+static void M_EndGame(int choice);
+static void M_ReadThis(int choice);
+static void M_ReadThis2(int choice);
+static void M_QuitDOOM(int choice);
+
+static void M_ChangeMessages(int choice);
+static void M_SfxVol(int choice);
+static void M_MusicVol(int choice);
+/* void M_ChangeDetail(int choice);  unused -- killough */
+
+static void M_FinishReadThis(int choice);
+static void M_QuickSave(void);
+static void M_QuickLoad(void);
+
+static void M_DrawMainMenu(void);
+static void M_DrawReadThis1(void);
+static void M_DrawReadThis2(void);
+static void M_DrawNewGame(void);
+static void M_DrawEpisode(void);
+static void M_DrawSound(void);
+
+static void M_DrawThermo(int x, int y, int thermWidth, int thermDot, byte *cr);
+static void WriteTextCR(int x, int y, byte *cr, const char *string);
+static void WriteText(int x, int y, const char *string);
+
+// phares 3/30/98
+// prototypes added to support Setup Menus and Extended HELP screens
+
+static void M_Options(int choice);
+static void M_ClearMenus(void);
+
+static void M_InitExtendedHelp(void);
+static void M_ExtHelpNextScreen(int choice);
+static void M_ExtHelp(int choice);
+static void M_DrawExtHelp(void);
+
+static void M_CustomSkill(int choice);
+
+static void M_PauseSound(void)
+{
+    if (!paused && gamestate == GS_LEVEL && !demoplayback && !netgame)
+    {
+        S_PauseSound();
+    }
+}
+
+static void M_ResumeSound(void)
+{
+    if (!paused && gamestate == GS_LEVEL && !demoplayback && !netgame)
+    {
+        S_ResumeSound();
+    }
+}
+
+//
+// SetNextMenu
+//
+
+static void SetNextMenu(menu_t *menudef)
+{
+    currentMenu = menudef;
+    itemOn = currentMenu->lastOn;
+    highlight_item = 0;
+}
+
+static menu_t NewDef; // phares 5/04/98
+
+// end of prototypes added to support Setup Menus and Extended HELP screens
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DOOM MENUS
+//
+
+/////////////////////////////
+//
+// MAIN MENU
+//
+
+// main_e provides numerical values for which Big Font screen you're on
+
+enum
+{
+    newgame = 0,
+    options,
+    loadgame,
+    savegame,
+    readthis,
+    quitdoom,
+    main_end
+} main_e;
+
+//
+// MainMenu is the definition of what the main menu Screen should look
+// like. Each entry shows that the cursor can land on each item (1), the
+// built-in graphic lump (i.e. "M_NGAME") that should be displayed,
+// the program which takes over when an item is selected, and the hotkey
+// associated with the item.
+//
+
+#define MAIN_MENU_RECT \
+    {0, 0, SCREENWIDTH, LINEHEIGHT}
+
+static menuitem_t MainMenu[] = {
+    {1, "M_NGAME",  M_NewGame,  'n', "New Game",   MAIN_MENU_RECT},
+    // change M_Options to M_Setup
+    {1, "M_OPTION", M_Options,  'o', "Options",    MAIN_MENU_RECT},
+    {1, "M_LOADG",  M_LoadGame, 'l', "Load Game",  MAIN_MENU_RECT},
+    {1, "M_SAVEG",  M_SaveGame, 's', "Save Game",  MAIN_MENU_RECT},
+    // Another hickup with Special edition.
+    {1, "M_RDTHIS", M_ReadThis, 'r', "Read This!", MAIN_MENU_RECT},
+    {1, "M_QUITG",  M_QuitDOOM, 'q', "Quit",       MAIN_MENU_RECT}
+};
+
+static menu_t MainDef = {
+    main_end,       // number of menu items
+    NULL,           // previous menu screen
+    MainMenu,       // table that defines menu items
+    M_DrawMainMenu, // drawing routine
+    97,
+    64, // initial cursor position
+    0   // last menu item the user was on
+};
+
+//
+// M_DrawMainMenu
+//
+
+static void M_DrawMainMenu(void)
+{
+    options_active = false;
+
+    V_DrawPatch(94, 2, V_CachePatchName("M_DOOM", PU_CACHE));
+}
+
+/////////////////////////////
+//
+// Read This! MENU 1 & 2
+//
+
+// There are no menu items on the Read This! screens, so read_e just
+// provides a placeholder to maintain structure.
+
+enum
+{
+    rdthsempty1,
+    read1_end
+} read_e;
+
+enum
+{
+    rdthsempty2,
+    read2_end
+} read_e2;
+
+enum // killough 10/98
+{
+    helpempty,
+    help_end
+} help_e;
+
+// The definitions of the Read This! screens
+
+static menuitem_t ReadMenu1[] = {
+    {1, "", M_ReadThis2, 0}
+};
+
+static menuitem_t ReadMenu2[] = {
+    {1, "", M_FinishReadThis, 0}
+};
+
+static menu_t ReadDef1 = {
+    read1_end,
+    &MainDef,
+    ReadMenu1,
+    M_DrawReadThis1,
+    330, 175,
+    // 280,185,              // killough 2/21/98: fix help screens
+    0
+};
+
+static menu_t ReadDef2 = {
+    read2_end,
+    &ReadDef1,
+    ReadMenu2,
+    M_DrawReadThis2,
+    330, 175,
+    0
+};
+
+//
+// M_ReadThis
+//
+
+static void M_ReadThis(int choice)
+{
+    SetNextMenu(&ReadDef1);
+}
+
+static void M_ReadThis2(int choice)
+{
+    SetNextMenu(&ReadDef2);
+}
+
+static void M_FinishReadThis(int choice)
+{
+    SetNextMenu(&MainDef);
+}
+
+//
+// Read This Menus
+// Had a "quick hack to fix romero bug"
+//
+// killough 10/98: updated with new screens
+
+static void M_DrawReadThis1(void)
+{
+    V_DrawPatchFullScreen(
+        V_CachePatchName(W_CheckWidescreenPatch("HELP2"), PU_CACHE));
+}
+
+//
+// Read This Menus - optional second page.
+//
+// killough 10/98: updated with new screens
+
+static void M_DrawReadThis2(void)
+{
+    // Display help screen from PWAD
+    int helplump;
+    if (gamemode == commercial)
+    {
+        helplump = W_CheckNumForName(W_CheckWidescreenPatch("HELP"));
+    }
+    else
+    {
+        helplump = W_CheckNumForName(W_CheckWidescreenPatch("HELP1"));
+    }
+
+    V_DrawPatchFullScreen(V_CachePatchNum(helplump, PU_CACHE));
+}
+
+static void M_DrawReadThisCommercial(void)
+{
+    V_DrawPatchFullScreen(
+        V_CachePatchName(W_CheckWidescreenPatch("HELP"), PU_CACHE));
+}
+
+/////////////////////////////
+//
+// EPISODE SELECT
+//
+
+//
+// episodes_e provides numbers for the episode menu items. The default is
+// 4, to accomodate Ultimate Doom. If the user is running anything else,
+// this is accounted for in the code.
+//
+
+enum
+{
+    ep1,
+    ep2,
+    ep3,
+    ep4,
+    ep_end
+} episodes_e;
+
+#define MAX_EPISODES 10 // [FG] UMAPINFO spec says 8, but oh well...
+
+// The definitions of the Episodes menu
+
+#define M_Y_EPISODES 63
+
+#define EPISODES_RECT(n) \
+    {0, M_Y_EPISODES + (n) * LINEHEIGHT, SCREENWIDTH, LINEHEIGHT}
+
+static menuitem_t EpisodeMenu[MAX_EPISODES] = // added a few free entries for UMAPINFO
+{
+    {1, "M_EPI1", M_Episode, 'k', "Knee-Deep in the Dead", EPISODES_RECT(0)},
+    {1, "M_EPI2", M_Episode, 't', "The Shores of Hell",    EPISODES_RECT(1)},
+    {1, "M_EPI3", M_Episode, 'i', "Inferno",               EPISODES_RECT(2)},
+    {1, "M_EPI4", M_Episode, 't', "Thy Flesh Consumed",    EPISODES_RECT(3)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(4)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(5)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(6)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(7)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(8)},
+    {1, "",       M_Episode, '0', NULL, EPISODES_RECT(9)}
+};
+
+static menu_t EpiDef = {
+    ep_end,        // # of menu items
+    &MainDef,      // previous menu
+    EpisodeMenu,   // menuitem_t ->
+    M_DrawEpisode, // drawing routine ->
+    48, M_Y_EPISODES, // x,y
+    ep1           // lastOn
+};
+
+// This is for customized episode menus
+boolean EpiCustom;
+static short EpiMenuMap[MAX_EPISODES] = {1, 1, 1, 1, -1, -1, -1, -1, -1, -1};
+static short EpiMenuEpi[MAX_EPISODES] = {1, 2, 3, 4, -1, -1, -1, -1, -1, -1};
+
+//
+//    M_Episode
+//
+static int epiChoice;
+
+void MN_ClearEpisodes(void)
+{
+    EpiDef.numitems = 0;
+    NewDef.prevMenu = &MainDef;
+}
+
+void MN_AddEpisode(const char *map, const char *gfx, const char *txt, char key)
+{
+    int epi, mapnum;
+
+    if (!EpiCustom)
+    {
+        EpiCustom = true;
+        NewDef.prevMenu = &EpiDef;
+
+        if (gamemode == commercial)
+        {
+            EpiDef.numitems = 0;
+        }
+    }
+
+    if (EpiDef.numitems == 8)
+    {
+        I_Printf(VB_WARNING,
+                 "MN_AddEpisode: UMAPINFO spec limit of 8 episodes exceeded!");
+    }
+    else if (EpiDef.numitems >= MAX_EPISODES)
+    {
+        return;
+    }
+
+    MI_LumpName(map, &epi, &mapnum);
+    EpiMenuEpi[EpiDef.numitems] = epi;
+    EpiMenuMap[EpiDef.numitems] = mapnum;
+    M_CopyLumpName(EpisodeMenu[EpiDef.numitems].name, gfx);
+    EpisodeMenu[EpiDef.numitems].alttext = txt ? strdup(txt) : NULL;
+    EpisodeMenu[EpiDef.numitems].alphaKey = key;
+    EpiDef.numitems++;
+
+    if (EpiDef.numitems <= 4)
+    {
+        EpiDef.y = 63;
+    }
+    else
+    {
+        EpiDef.y = MAX(25, 63 - (EpiDef.numitems - 4) * (LINEHEIGHT / 2));
+    }
+}
+
+static void M_DrawEpisode(void)
+{
+    MN_DrawTitle(54, EpiDef.y - 25, "M_EPISOD", "Which Episode?");
+}
+
+static void M_Episode(int choice)
+{
+    if (!EpiCustom)
+    {
+        if ((gamemode == shareware) && choice)
+        {
+            M_StartMessage(DEH_String(SWSTRING), NULL, false);
+            SetNextMenu(&ReadDef1);
+            return;
+        }
+
+        // Yet another hack...
+        if (gamemode == registered && choice > 2)
+        {
+            choice = 0; // killough 8/8/98
+        }
+    }
+    epiChoice = choice;
+    SetNextMenu(&NewDef);
+}
+
+/////////////////////////////
+//
+// NEW GAME
+//
+
+// The definitions of the New Game menu
+
+#define M_Y_NEWGAME 63
+
+#define NEW_GAME_RECT(n) \
+    {0, M_Y_NEWGAME + (n) * LINEHEIGHT, SCREENWIDTH, LINEHEIGHT}
+
+static menu_t NewDef = {
+    .prevMenu = &EpiDef,
+    .routine = M_DrawNewGame,
+    .x = 48, .y =  M_Y_NEWGAME,
+};
+
+static void InitializeSkillMenu(void)
+{
+    if (NewDef.numitems) // Already initialized?
+    {
+        return;
+    }
+
+    NewDef.lastOn = default_skill - 1;
+    NewDef.numitems = num_skills;
+    NewDef.menuitems = calloc(num_skills, sizeof(*NewDef.menuitems));
+
+    for (int i = 0; i < num_og_skills; ++i)
+    {
+        NewDef.menuitems[i].status = 1;
+        NewDef.menuitems[i].rect = (mrect_t)NEW_GAME_RECT(i);
+
+        if (skill_infos[i].pic_name)
+        {
+            M_CopyLumpName(NewDef.menuitems[i].name, skill_infos[i].pic_name);
+        }
+
+        NewDef.menuitems[i].alttext = skill_infos[i].name;
+
+        NewDef.menuitems[i].routine = M_ChooseSkill;
+        NewDef.menuitems[i].alphaKey = skill_infos[i].key;
+
+        if (skill_infos[i].flags & SI_DEFAULT_SKILL)
+        {
+            NewDef.lastOn = i;
+        }
+    }
+    menuitem_t cskill_item = {.status = 1,
+                              .name = "M_CSTSKL",
+                              .routine = M_CustomSkill,
+                              .alphaKey = 'c',
+                              .alttext = "Custom Skill...",
+                              .rect = NEW_GAME_RECT(num_cskill),
+                              .flags = MF_OPTLUMP};
+
+    NewDef.menuitems[num_cskill] = cskill_item;
+
+    if (NewDef.lastOn >= num_skills)
+    {
+        NewDef.lastOn = num_skills - 1;
+    }
+
+    csmenu_skill = sk_medium;
+}
+
+//
+// M_NewGame
+//
+
+static void M_DrawNewGame(void)
+{
+    customskill_active = false;
+    MN_DrawTitle(96, 14, "M_NEWG", "NEW GAME");
+    MN_DrawTitle(54, 38, "M_SKILL", "Choose Skill Level:");
+}
+
+static void M_NewGame(int choice)
+{
+    if (demorecording) // killough 5/26/98: exclude during demo recordings
+    {
+        M_StartMessage("you can't start a new game\n"
+                       "while recording a demo!\n\n" PRESSKEY,
+                       NULL, false); // killough 5/26/98: not externalized
+        return;
+    }
+
+    if (((gamemode == commercial) && !EpiCustom) || EpiDef.numitems <= 1)
+    {
+        SetNextMenu(&NewDef);
+    }
+    else
+    {
+        epiChoice = 0;
+        SetNextMenu(&EpiDef);
+    }
+}
+
+static int chosen_skill;
+
+static void FinishGameSelection(void)
+{
+    int episode;
+    int map;
+
+    //jff 3/24/98 remember last skill selected
+    // killough 10/98 moved to here
+    default_skill = chosen_skill + 1;
+
+    if (!EpiCustom)
+    {
+        episode = epiChoice + 1;
+        map = 1;
+    }
+    else
+    {
+        episode = EpiMenuEpi[epiChoice];
+        map = EpiMenuMap[epiChoice];
+    }
+
+    if (netgame)
+    {
+        // A network game is left by the main loop, outside of the menu code.
+        MP_RequestSingleGame(chosen_skill, episode, map);
+    }
+    else
+    {
+        G_DeferedInitNew(chosen_skill, episode, map);
+    }
+
+    M_ClearMenus();
+}
+
+static void VerifySkill(int ch)
+{
+    if (ch != 'y')
+    {
+        return;
+    }
+
+    FinishGameSelection();
+}
+
+void M_ChooseSkill(int choice)
+{
+    chosen_skill = choice;
+
+    if (choice < num_skills && skill_infos[choice].flags & SI_MUST_CONFIRM)
+    {
+        const char* message;
+
+        if (skill_infos[choice].must_confirm)
+            message = skill_infos[choice].must_confirm;
+        else
+            message = DEH_String(NIGHTMARE);
+
+        M_StartMessage(message, VerifySkill, true);
+        return;
+    }
+
+    FinishGameSelection();
+}
+
+static void M_CustomSkill(int choice)
+{
+    customskill_active = true;
+    MN_CSMenuOpen();
+}
+
+/////////////////////////////
+//
+// LOAD GAME MENU
+//
+
+//
+// killough 5/15/98: add forced loadgames
+//
+
+static void M_VerifyForcedLoadGame(int ch)
+{
+    if (ch == 'y')
+    {
+        G_ForcedLoadGame();
+    }
+    M_ClearMenus();
+}
+
+void MN_ForcedLoadGame(const char *msg)
+{
+    M_StartMessage(strdup(msg), M_VerifyForcedLoadGame, true); // free()'d above
+}
+
+//
+// Selected from DOOM menu
+//
+
+static void M_LoadGame(int choice)
+{
+    if (netgame && !demoplayback) // killough 5/26/98: add !demoplayback
+    {
+        M_StartMessage(DEH_String(LOADNET), NULL, false); // Ty 03/27/98 - externalized
+        return;
+    }
+
+    if (demorecording) // killough 5/26/98: exclude during demo recordings
+    {
+        M_StartMessage("you can't load a game\n"
+                       "while recording a demo!\n\n" PRESSKEY,
+                       NULL, false); // killough 5/26/98: not externalized
+        return;
+    }
+
+    MN_SaveLoadOpen(false);
+}
+
+/////////////////////////////
+//
+// SAVE GAME MENU
+//
+
+void M_SaveAutoSave(void)
+{
+    char autosave_string[SAVE_STRING_SIZE];
+
+    MN_SetDefaultSaveName(autosave_string, "Auto");
+    G_SaveAutoSave(autosave_string);
+}
+
+//
+// Selected from DOOM menu
+//
+
+static void M_SaveGame(int choice)
+{
+    // killough 10/6/98: allow savegames during single-player demo playback
+    if (!usergame && (!demoplayback || netgame))
+    {
+        M_StartMessage(DEH_String(SAVEDEAD), NULL, false);
+        return;
+    }
+
+    if (gamestate != GS_LEVEL)
+    {
+        return;
+    }
+
+    MN_SaveLoadOpen(true);
+}
+
+/////////////////////////////
+//
+// M_QuitDOOM
+//
+static int quitsounds[8] = {sfx_pldeth, sfx_dmpain, sfx_popain, sfx_slop,
+                            sfx_telept, sfx_posit1, sfx_posit3, sfx_sgtatk};
+
+static int quitsounds2[8] = {sfx_vilact, sfx_getpow, sfx_boscub, sfx_slop,
+                             sfx_skeswg, sfx_kntdth, sfx_bspact, sfx_sgtatk};
+
+static void M_QuitResponse(int ch)
+{
+    if (ch != 'y')
+    {
+        return;
+    }
+    if (quit_sound &&
+        (!netgame || demoplayback) && // killough 12/98
+        !nosfxparm)                   // avoid delay if no sound card
+    {
+        if (gamemode == commercial)
+        {
+            M_StartSound(quitsounds2[(gametic >> 2) & 7]);
+        }
+        else
+        {
+            M_StartSound(quitsounds[(gametic >> 2) & 7]);
+        }
+        I_WaitVBL(105);
+    }
+    I_SafeExit(0); // killough
+}
+
+static void M_QuitDOOM(int choice)
+{
+    static char endstring[160];
+
+    // killough 1/18/98: fix endgame message calculation:
+    M_snprintf(endstring, sizeof(endstring), "%s\n\n%s",
+                DEH_String(strings_quit_messages[gametic % num_quit_mnemonics]),
+                DEH_String(DOSY));
+
+    if (quit_prompt)
+    {
+        M_StartMessage(endstring, M_QuitResponse, true);
+    }
+    else
+    {
+        M_QuitResponse('y');
+    }
+}
+
+/////////////////////////////
+//
+// SOUND VOLUME MENU
+//
+
+// numerical values for the Sound Volume menu items
+// The 'empty' slots are where the sliding scales appear.
+
+enum
+{
+    sfx_vol,
+    sfx_vol_thermo,
+    music_vol,
+    music_vol_thermo,
+    sound_end
+} sound_e;
+
+// The definitions of the Sound Volume menu
+
+#define THERMO_VOLUME_RECT(n) \
+    {80 /*SoundDef.x*/, 64 /*SoundDef.y*/ + LINEHEIGHT *(n), (16 + 2) * 8, 13}
+
+static menuitem_t SoundMenu[] = {
+    {2,  "M_SFXVOL", M_SfxVol,   's', "Sfx Volume",   {0},                                  MF_THRM_STR},
+    {-1, "",         NULL,       0,   NULL,           THERMO_VOLUME_RECT(sfx_vol_thermo),   MF_THRM    },
+    {2,  "M_MUSVOL", M_MusicVol, 'm', "Music Volume", {0},                                  MF_THRM_STR},
+    {-1, "",         NULL,       0,   NULL,           THERMO_VOLUME_RECT(music_vol_thermo), MF_THRM    },
+};
+
+static menu_t SoundDef = {
+    sound_end, &MainDef, SoundMenu, M_DrawSound, 80, 64, 0
+};
+
+//
+// Change Sfx & Music volumes
+//
+
+static void M_DrawSound(void)
+{
+    MN_DrawTitle(M_X_CENTER, 38, "M_SVOL", "Sound Volume");
+
+    int index = highlight_item + 1;
+    menuitem_t *item = &currentMenu->menuitems[index];
+    byte *cr;
+
+    if (index == sfx_vol_thermo && (item->flags & MF_HILITE))
+    {
+        cr = xlat[CR_BRIGHT].table;
+    }
+    else
+    {
+        cr = NULL;
+    }
+
+    M_DrawThermo(SoundDef.x, SoundDef.y + LINEHEIGHT * sfx_vol_thermo, 16,
+                 snd_SfxVolume, cr);
+
+    if (index == music_vol_thermo && (item->flags & MF_HILITE))
+    {
+        cr = xlat[CR_BRIGHT].table;
+    }
+    else
+    {
+        cr = NULL;
+    }
+
+    M_DrawThermo(SoundDef.x, SoundDef.y + LINEHEIGHT * music_vol_thermo, 16,
+                 snd_MusicVolume, cr);
+}
+
+void M_Sound(int choice)
+{
+    SetNextMenu(&SoundDef);
+}
+
+#define M_MAX_VOL 15
+
+static void M_SfxVol(int choice)
+{
+    switch (choice)
+    {
+        case CHOICE_LEFT:
+            if (snd_SfxVolume)
+            {
+                snd_SfxVolume--;
+            }
+            break;
+        case CHOICE_RIGHT:
+            if (snd_SfxVolume < M_MAX_VOL)
+            {
+                snd_SfxVolume++;
+            }
+            break;
+        default:
+            if (choice >= CHOICE_VALUE)
+            {
+                snd_SfxVolume = choice;
+            }
+            break;
+    }
+
+    S_SetSfxVolume(snd_SfxVolume /* *8 */);
+}
+
+static void M_MusicVol(int choice)
+{
+    switch (choice)
+    {
+        case CHOICE_LEFT:
+            if (snd_MusicVolume)
+            {
+                snd_MusicVolume--;
+            }
+            break;
+        case CHOICE_RIGHT:
+            if (snd_MusicVolume < M_MAX_VOL)
+            {
+                snd_MusicVolume++;
+            }
+            break;
+        default:
+            if (choice >= CHOICE_VALUE)
+            {
+                snd_MusicVolume = choice;
+            }
+            break;
+    }
+
+    S_SetMusicVolume(snd_MusicVolume /* *8 */);
+}
+
+/////////////////////////////
+//
+//    M_QuickSave
+//
+
+static void M_QuickSave(void)
+{
+    if (!usergame && (!demoplayback || netgame)) // killough 10/98
+    {
+        M_StartSound(sfx_mnuerr);
+        return;
+    }
+
+    if (gamestate != GS_LEVEL)
+    {
+        return;
+    }
+
+    MN_QuickSave();
+}
+
+/////////////////////////////
+//
+// M_QuickLoad
+//
+
+static void M_QuickLoad(void)
+{
+    if (netgame && !demoplayback) // killough 5/26/98: add !demoplayback
+    {
+        M_StartSound(sfx_mnuopn);
+        M_StartMessage(DEH_String(QLOADNET), NULL, false);
+        return;
+    }
+
+    if (demorecording) // killough 5/26/98: exclude during demo recordings
+    {
+        M_StartSound(sfx_mnuopn);
+        M_StartMessage("you can't quickload\n"
+                       "while recording a demo!\n\n" PRESSKEY,
+                       NULL, false); // killough 5/26/98: not externalized
+        return;
+    }
+
+    // Quick Load before Quick Save is just regular Load
+    if (!MN_QuickSaveUsed())
+    {
+        MN_StartControlPanel();
+        M_LoadGame(0);
+        return;
+    }
+
+    MN_LoadQuickSave();
+}
+
+/////////////////////////////
+//
+// M_EndGame
+//
+
+static void M_EndGameResponse(int ch)
+{
+    if (ch != 'y')
+    {
+        return;
+    }
+
+    // killough 5/26/98: make endgame quit if recording or playing back demo
+    if (demorecording || singledemo)
+    {
+        G_CheckDemoStatus();
+    }
+
+    currentMenu->lastOn = itemOn;
+    S_EvictChannels();
+    M_ClearMenus();
+
+    // A network game is left by the main loop, outside of the menu code.
+    if (netgame)
+    {
+        MP_RequestLeave();
+        return;
+    }
+
+    D_StartTitle();
+}
+
+static void M_EndGame(int choice)
+{
+    M_StartMessage(DEH_String(ENDGAME), M_EndGameResponse, true);
+}
+
+/////////////////////////////
+//
+//    Toggle messages on/off
+//
+
+static void M_ChangeMessages(int choice)
+{
+    show_messages = 1 - show_messages;
+
+    if (!show_messages)
+    {
+        displaymsg("%s", DEH_String(MSGOFF));
+    }
+    else
+    {
+        displaymsg("%s", DEH_String(MSGON));
+    }
+}
+
+/////////////////////////////
+//
+// CHANGE DISPLAY SIZE
+//
+// jff 2/23/98 restored to pre-HUD state
+// hud_active controlled soley by F5=key_detail (key_hud)
+// hud_displayed is toggled by + or = in fullscreen
+// hud_displayed is cleared by -
+
+static void M_SizeDisplay(int choice)
+{
+    if (choice == 0 && screenblocks > 3)
+    {
+        screenblocks--;
+    }
+    else if (choice == 1 && screenblocks < maxscreenblocks)
+    {
+        screenblocks++;
+    }
+    else
+    {
+        return;
+    }
+    R_SetViewSize(screenblocks /*, detailLevel obsolete -- killough */);
+    M_StartSound(sfx_mnusli);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Start of Extended HELP screens               // phares 3/30/98
+//
+// The wad designer can define a set of extended HELP screens for their own
+// information display. These screens should be 320x200 graphic lumps
+// defined in a separate wad. They should be named "HELP01" through "HELP99".
+// "HELP01" is shown after the regular BOOM Dynamic HELP screen, and ENTER
+// and BACKSPACE keys move the player through the HELP set.
+//
+// Rather than define a set of menu definitions for each of the possible
+// HELP screens, one definition is used, and is altered on the fly
+// depending on what HELPnn lumps the game finds.
+
+// phares 3/30/98:
+// Extended Help Screen variables
+
+static int extended_help_count; // number of user-defined help screens found
+static int extended_help_index; // index of current extended help screen
+
+static menuitem_t ExtHelpMenu[] = {
+    {1, "", M_ExtHelpNextScreen, 0}
+};
+
+static menu_t ExtHelpDef = {
+    1,           // # of menu items
+    &ReadDef1,   // previous menu
+    ExtHelpMenu, // menuitem_t ->
+    M_DrawExtHelp, // drawing routine ->
+    330, 181, // x,y
+    0    // lastOn
+};
+
+// M_ExtHelpNextScreen establishes the number of the next HELP screen in
+// the series.
+
+static void M_ExtHelpNextScreen(int choice)
+{
+    if (++extended_help_index > extended_help_count)
+    {
+
+        // when finished with extended help screens, return to Main Menu
+
+        extended_help_index = 1;
+        SetNextMenu(&MainDef);
+    }
+}
+
+// phares 3/30/98:
+// Routine to look for HELPnn screens and create a menu
+// definition structure that defines extended help screens.
+
+static void M_InitExtendedHelp(void)
+{
+    int index, i;
+    char namebfr[] = "HELPnn"; // haleyjd: can't write into constant
+
+    extended_help_count = 0;
+    for (index = 1; index < 100; index++)
+    {
+        namebfr[4] = index / 10 + 0x30;
+        namebfr[5] = index % 10 + 0x30;
+        i = W_CheckNumForName(namebfr);
+        if (i == -1)
+        {
+            if (extended_help_count)
+            {
+                // Restore extended help functionality
+                // for all game versions
+                ExtHelpDef.prevMenu = &ReadDef2; // previous menu
+                ReadMenu2[0].routine = M_ExtHelp;
+            }
+            return;
+        }
+        extended_help_count++;
+    }
+}
+
+// Initialization for the extended HELP screens.
+
+static void M_ExtHelp(int choice)
+{
+    extended_help_index = 1; // Start with first extended help screen
+    SetNextMenu(&ExtHelpDef);
+}
+
+// Initialize the drawing part of the extended HELP screens.
+
+static void M_DrawExtHelp(void)
+{
+    char namebfr[] = "HELPnn"; // [FG] char array!
+    namebfr[4] = extended_help_index / 10 + 0x30;
+    namebfr[5] = extended_help_index % 10 + 0x30;
+    V_DrawPatchFullScreen(V_CachePatchName(namebfr, PU_CACHE));
+}
+
+//
+// End of Extended HELP screens               // phares 3/30/98
+//
+////////////////////////////////////////////////////////////////////////////
+
+static void M_Options(int choice)
+{
+    options_active = true;
+    MN_OptionsOpen();
+}
+
+//
+// M_ClearMenus
+//
+// Called when leaving the menu screens for the real world
+
+static void M_ClearMenus(void)
+{
+    menuactive = 0;
+    mouse_active_thermo = false;
+    options_active = false;
+    customskill_active = false;
+    MN_ContainerClose();
+    print_warning_about_changes = 0; // killough 8/15/98
+
+    I_SetSensorEventState(false);
+    G_ClearInput();
+    M_ResumeSound();
+}
+
+void MN_CloseMenu(void)
+{
+    M_ClearMenus();
+}
+
+static boolean MenuBack(void)
+{
+    if (!currentMenu->prevMenu)
+    {
+        return false;
+    }
+
+    currentMenu = currentMenu->prevMenu;
+    itemOn = currentMenu->lastOn;
+    highlight_item = 0;
+    M_StartSound(sfx_mnubak);
+    return true;
+}
+
+//
+// M_Init
+//
+
+#define MAX_STRLEN 42
+
+static void AddLineBreaks(char *string)
+{
+    char *start = string;
+    char *p = start;
+
+    while (strlen(p) > MAX_STRLEN)
+    {
+        start = p;
+        p += MAX_STRLEN;
+
+        do
+        {
+            if (*p == ' ')
+            {
+                *p++ = '\n';
+                break;
+            }
+        } while (--p > start);
+
+        if (p == start)
+        {
+            break;
+        }
+    }
+}
+
+#undef MAX_STRLEN
+
+void M_Init(void)
+{
+    currentMenu = &MainDef;
+    menuactive = 0;
+    itemOn = currentMenu->lastOn;
+    highlight_item = 0;
+    whichSkull = 0;
+    skullAnimCounter = 10;
+    messageToPrint = 0;
+    messageString = NULL;
+    messageLastMenuActive = menuactive;
+
+    int lumpnum = W_CheckNumForName("DBIGFONT");
+    if (lumpnum >= 0)
+    {
+        bigfont_priority = lumpinfo[lumpnum].handle.priority;
+        MN_LoadFon2(W_CacheLumpNum(lumpnum, PU_CACHE), W_LumpLength(lumpnum));
+    }
+
+    // Here we could catch other version dependencies,
+    //  like HELP1/2, and four episodes.
+
+    if (gameversion >= exe_ultimate)
+    {
+        MainMenu[readthis].routine = M_ReadThis2;
+        ReadDef2.prevMenu = NULL;
+    }
+
+    if (gameversion == exe_final || gameversion == exe_final2)
+    {
+        ReadDef2.routine = M_DrawReadThisCommercial;
+        // [crispy] rearrange Skull in Final Doom HELP screen
+        ReadDef2.y -= 10;
+    }
+
+    if (gamemode == commercial)
+    {
+        // This is used because DOOM 2 had only one HELP
+        //  page. I use CREDIT as second page now, but
+        //  kept this hack for educational purposes.
+        MainMenu[readthis] = MainMenu[quitdoom];
+        MainDef.numitems--;
+        MainDef.y += 8;
+        if (!EpiCustom || EpiDef.numitems <= 1)
+        {
+            NewDef.prevMenu = &MainDef;
+        }
+        ReadDef1.routine = M_DrawReadThisCommercial;
+        ReadDef1.x = 330;
+        ReadDef1.y = 165;
+        ReadMenu1[0].routine = M_FinishReadThis;
+    }
+
+    if (pwad_help2)
+    {
+        MainMenu[readthis].routine = M_ReadThis;
+        ReadDef2.prevMenu = &ReadDef1;
+    }
+    else if (gamemode == retail)
+    {
+        MainMenu[readthis].routine = M_ReadThis2;
+        ReadDef2.prevMenu = NULL;
+    }
+
+    // Versions of doom.exe before the Ultimate Doom release only had
+    // three episodes; if we're emulating one of those then don't try
+    // to show episode four. If we are, then do show episode four
+    // (should crash if missing).
+    if (gameversion < exe_ultimate && !EpiCustom)
+    {
+        EpiDef.numitems--;
+    }
+
+    M_InitExtendedHelp(); // init extended help screens // phares 3/30/98
+
+    // [crispy] remove DOS reference from the game quit confirmation dialogs
+    {
+        const char *platform = I_GetPlatform();
+        const char *string;
+        char *replace;
+
+        // [crispy] "i wouldn't leave if i were you.\ndos is much worse."
+        string = strings_quit_messages[3];
+        if (!DEH_HasStringReplacement(string))
+        {
+            replace = M_StringReplace(string, "dos", platform);
+            DEH_AddStringReplacement(string, replace);
+            free(replace);
+        }
+
+        // [crispy] "you're trying to say you like dos\nbetter than me, right?"
+        string = strings_quit_messages[4];
+        if (!DEH_HasStringReplacement(string))
+        {
+            replace = M_StringReplace(string, "dos", platform);
+            DEH_AddStringReplacement(string, replace);
+            free(replace);
+        }
+
+        // [crispy] "don't go now, there's a \ndimensional shambler waiting\nat the dos prompt!"
+        string = strings_quit_messages[9];
+        if (!DEH_HasStringReplacement(string))
+        {
+            char *replace2 = NULL;
+            replace = M_StringReplace(string, "dos", platform);
+#if defined(_WIN32)
+            replace2 = M_StringReplace(replace, "prompt", "desktop");
+#else
+            replace2 = isatty(STDOUT_FILENO)
+                    ? M_StringReplace(replace, "prompt", "shell")
+                    : M_StringReplace(replace, "prompt", "desktop");
+#endif
+            DEH_AddStringReplacement(string, replace2);
+            free(replace2);
+            free(replace);
+        }
+
+        for (int i = 0; i < num_quit_mnemonics; i++)
+        {
+            replace = M_StringDuplicate(DEH_String(strings_quit_messages[i]));
+            if (strchr(replace, '\n') == NULL)
+            {
+                AddLineBreaks(replace);
+            }
+            DEH_AddStringReplacement(strings_quit_messages[i], replace);
+            free(replace);
+        }
+    }
+}
+
+/////////////////////////////
+//
+// M_Ticker
+//
+
+void M_Ticker(void)
+{
+    if (--skullAnimCounter <= 0)
+    {
+        whichSkull ^= 1;
+        skullAnimCounter = 8;
+    }
+
+    if (MN_ContainerActive())
+    {
+        MN_ContainerTicker();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// M_Responder
+//
+// Examines incoming keystrokes and button pushes and determines some
+// action based on the state of the system.
+//
+
+boolean M_ShortcutResponder(const event_t *ev)
+{
+    // If there is no active menu displayed...
+
+    if (menuactive || chat_on)
+    {
+        return false;
+    }
+
+    if (M_InputActivated(input_netgame_stats))
+    {
+        if (gamestate == GS_LEVEL && (netgame || deathmatch))
+        {
+            wi_overlay = !wi_overlay;
+            return true;
+        }
+    }
+
+    if (M_InputActivated(input_autorun)) // Autorun
+    {
+        autorun = !autorun;
+        togglemsg("Always Run %s", autorun ? "On" : "Off");
+        // return true; // [FG] don't let toggles eat keys
+    }
+
+    if (M_InputActivated(input_novert))
+    {
+        novert = !novert;
+        togglemsg("Vertical Mouse %s", !novert ? "On" : "Off");
+        // return true; // [FG] don't let toggles eat keys
+    }
+
+    if (M_InputActivated(input_freelook))
+    {
+        freelook = !freelook;
+        togglemsg("Free Look %s", freelook ? "On" : "Off");
+        MN_OptionsUpdateFreeLook();
+        // return true; // [FG] don't let toggles eat keys
+    }
+
+    if (M_InputActivated(input_speed_up) && !D_CheckNetConnect() && !strictmode)
+    {
+        realtic_clock_rate += 10;
+        realtic_clock_rate = CLAMP(realtic_clock_rate, 10, 1000);
+        displaymsg("Game Speed: %d", realtic_clock_rate);
+        G_SetTimeScale();
+        setrefreshneeded = true;
+    }
+
+    if (M_InputActivated(input_speed_down) && !D_CheckNetConnect()
+        && !strictmode)
+    {
+        realtic_clock_rate -= 10;
+        realtic_clock_rate = CLAMP(realtic_clock_rate, 10, 1000);
+        displaymsg("Game Speed: %d", realtic_clock_rate);
+        G_SetTimeScale();
+        setrefreshneeded = true;
+    }
+
+    if (M_InputActivated(input_speed_default) && !D_CheckNetConnect()
+        && !strictmode)
+    {
+        realtic_clock_rate = 100;
+        displaymsg("Game Speed: %d", realtic_clock_rate);
+        G_SetTimeScale();
+        setrefreshneeded = true;
+    }
+
+    if (M_InputActivated(input_help)) // Help key
+    {
+        boolean help2 = (gamemode < commercial || pwad_help2);
+        MN_StartControlPanel();
+        currentMenu = help2 ? &ReadDef1 : &ReadDef2; // killough 10/98: new help screen
+        currentMenu->prevMenu = NULL;
+        itemOn = 0;
+        return true;
+    }
+
+    if (M_InputActivated(input_savegame)) // Save Game
+    {
+        MN_StartControlPanel();
+        M_SaveGame(0);
+        return true;
+    }
+
+    if (M_InputActivated(input_loadgame)) // Load Game
+    {
+        MN_StartControlPanel();
+        M_LoadGame(0);
+        return true;
+    }
+
+    if (M_InputActivated(input_soundvolume)) // Sound Volume
+    {
+        MN_StartControlPanel();
+        currentMenu = &SoundDef;
+        itemOn = currentMenu->lastOn;
+        return true;
+    }
+
+    if (M_InputActivated(input_quicksave)) // Quicksave
+    {
+        M_QuickSave();
+        return true;
+    }
+
+    if (M_InputActivated(input_endgame)) // End game
+    {
+        M_PauseSound();
+        M_StartSound(sfx_mnuopn);
+        M_EndGame(0);
+        return true;
+    }
+
+    if (M_InputActivated(input_messages)) // Toggle messages
+    {
+        M_ChangeMessages(0);
+        M_StartSound(sfx_mnuopn);
+        return true;
+    }
+
+    if (M_InputActivated(input_quickload)) // Quickload
+    {
+        M_QuickLoad();
+        return true;
+    }
+
+    if (M_InputActivated(input_quit)) // Quit DOOM
+    {
+        if (quit_prompt)
+        {
+            M_PauseSound();
+            M_StartSound(sfx_mnuopn);
+        }
+        M_QuitDOOM(0);
+        return true;
+    }
+
+    if (M_InputActivated(input_gamma)) // gamma toggle
+    {
+        gamma2++;
+        if (gamma2 > GAMMA_MAX)
+        {
+            gamma2 = GAMMA_MIN;
+        }
+        togglemsg("Gamma correction level %s", gamma_strings[gamma2]);
+        V_ResetPalette();
+        return true;
+    }
+
+    if (M_InputActivated(input_zoomout)) // zoom out
+    {
+        if (automapactive)
+        {
+            return false;
+        }
+        M_SizeDisplay(0);
+        return true;
+    }
+
+    if (M_InputActivated(input_zoomin)) // zoom in
+    {                                   // jff 2/23/98
+        if (automapactive)              // allow
+        {                               // key_hud==key_zoomin
+            return false;
+        }
+        M_SizeDisplay(1);
+        return true;
+    }
+
+    if (M_InputActivated(input_hud)) // heads-up mode
+    {
+        if (automap_on) // jff 2/22/98
+        {
+            return false; // HUD mode control
+        }
+
+        if (screenblocks < 10)
+        {
+            screenblocks = 10;
+        }
+        else
+        {
+            ++screenblocks;
+            if (screenblocks > maxscreenblocks)
+            {
+                screenblocks = 10;
+            }
+        }
+
+        R_SetViewSize(screenblocks);
+        return true;
+    }
+
+    if (M_InputActivated(input_hud_timestats))
+    {
+        if (automapactive)
+        {
+            if ((hud_level_stats | hud_level_time) & HUD_WIDGET_AUTOMAP)
+            {
+                hud_level_stats &= ~HUD_WIDGET_AUTOMAP;
+                hud_level_time &= ~HUD_WIDGET_AUTOMAP;
+            }
+            else
+            {
+                hud_level_stats |= HUD_WIDGET_AUTOMAP;
+                hud_level_time |= HUD_WIDGET_AUTOMAP;
+            }
+        }
+        else
+        {
+            if ((hud_level_stats | hud_level_time) & HUD_WIDGET_HUD)
+            {
+                hud_level_stats &= ~HUD_WIDGET_HUD;
+                hud_level_time &= ~HUD_WIDGET_HUD;
+            }
+            else
+            {
+                hud_level_stats |= HUD_WIDGET_HUD;
+                hud_level_time |= HUD_WIDGET_HUD;
+            }
+        }
+        return true;
+    }
+
+    static boolean fastdemo_timer = false;
+
+    // [FG] reload current level / go to next level
+    if (M_InputActivated(input_menu_nextlevel))
+    {
+        if (demoplayback && singledemo && !PLAYBACK_SKIP)
+        {
+            fastdemo_timer = false;
+            playback_nextlevel = true;
+            G_EnableWarp(true);
+            return true;
+        }
+        else if (G_GotoNextLevel())
+        {
+            return true;
+        }
+    }
+
+    if (M_InputActivated(input_menu_prevlevel))
+    {
+        if (demoplayback && singledemo && !PLAYBACK_SKIP)
+        {
+            return false;
+        }
+        else if (G_GotoPrevLevel())
+        {
+            return true;
+        }
+    }
+
+    if (M_InputActivated(input_demo_fforward))
+    {
+        if (demoplayback && !PLAYBACK_SKIP && !fastdemo && !D_CheckNetConnect())
+        {
+            fastdemo_timer = !fastdemo_timer;
+            I_SetFastdemoTimer(fastdemo_timer);
+            return true;
+        }
+    }
+
+    if (M_InputActivated(input_rewind))
+    {
+        G_Rewind();
+        return true;
+    }
+
+    return false;
+}
+
+menu_input_mode_t help_input, old_help_input;
+menu_input_mode_t menu_input, old_menu_input;
+
+static int mouse_state_x, mouse_state_y;
+
+static boolean PointInsideRect(mrect_t *rect, int x, int y)
+{
+    return x > rect->x + video.deltaw && x < rect->x + rect->w + video.deltaw
+           && y > rect->y && y < rect->y + rect->h;
+}
+
+static void CursorPosition(void)
+{
+    if (!menuactive || messageToPrint)
+    {
+        return;
+    }
+
+    for (int i = 0; i < currentMenu->numitems; i++)
+    {
+        menuitem_t *item = &currentMenu->menuitems[i];
+        mrect_t *rect = &item->rect;
+
+        item->flags &= ~MF_HILITE;
+
+        if (PointInsideRect(rect, mouse_state_x, mouse_state_y))
+        {
+            if (item->flags & MF_THRM_STR)
+            {
+                continue;
+            }
+
+            item->flags |= MF_HILITE;
+
+            int cursor = i;
+
+            if (item->flags & MF_THRM)
+            {
+                cursor--;
+            }
+
+            if (highlight_item != cursor)
+            {
+                highlight_item = cursor;
+                M_StartSound(sfx_mnusel);
+            }
+        }
+    }
+}
+
+static void ClearHighlightedItems(void)
+{
+    for (int i = 0; i < currentMenu->numitems; ++i)
+    {
+        currentMenu->menuitems[i].flags &= ~MF_HILITE;
+    }
+}
+
+static void ResetMouseCursor(void)
+{
+    static boolean state;
+
+    if (menu_input == mouse_mode && !state)
+    {
+        state = true;
+        I_ShowMouseCursor(true);
+    }
+    else if (menu_input != mouse_mode && state)
+    {
+        state = false;
+        ClearHighlightedItems();
+        I_ShowMouseCursor(false);
+    }
+}
+
+static boolean MouseResponder(void)
+{
+    if (!menuactive || messageToPrint)
+    {
+        return false;
+    }
+
+    ResetMouseCursor();
+
+    menuitem_t *current_item = &currentMenu->menuitems[highlight_item];
+
+    if (current_item->flags & MF_THRM_STR)
+    {
+        current_item++;
+    }
+
+    mrect_t *rect = &current_item->rect;
+
+    if (M_InputActivated(input_menu_enter))
+    {
+        if (!PointInsideRect(rect, mouse_state_x, mouse_state_y))
+        {
+            return true; // eat event
+        }
+
+        itemOn = highlight_item;
+    }
+
+    if (!(current_item->flags & MF_THRM))
+    {
+        return false;
+    }
+
+    if (M_InputActivated(input_menu_enter))
+    {
+        mouse_active_thermo = true;
+    }
+    else if (M_InputDeactivated(input_menu_enter))
+    {
+        mouse_active_thermo = false;
+    }
+
+    if (mouse_active_thermo)
+    {
+        int dot = mouse_state_x - (rect->x + M_THRM_STEP + video.deltaw);
+        int step = M_MAX_VOL * FRACUNIT / (rect->w - M_THRM_STEP * 3);
+        int value = dot * step / FRACUNIT;
+        value = CLAMP(value, 0, M_MAX_VOL);
+
+        current_item--;
+        if (current_item->routine)
+        {
+            current_item->routine(value);
+            M_StartSound(sfx_mnusli);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+static void HandleContainerResult(mn_container_result_t result)
+{
+    switch (result)
+    {
+        case MN_CONTAINER_HANDLED:
+            return;
+
+        case MN_CONTAINER_CLOSE:
+            MN_ContainerClose();
+            MenuBack();
+            M_StartSound(sfx_mnubak);
+            break;
+
+        case MN_CONTAINER_ESCAPE:
+            M_ClearMenus(); // closes the container as well
+            M_StartSound(sfx_mnucls);
+            break;
+    }
+
+    help_input = old_help_input;
+    menu_input = old_menu_input;
+    ResetMouseCursor();
+}
+
+boolean M_Responder(event_t *ev)
+{
+    int ch;
+    static int joywait = 0;
+
+    static menu_action_t repeat = MENU_NULL;
+    menu_action_t action = MENU_NULL;
+
+    old_help_input = help_input;
+    old_menu_input = menu_input;
+
+    ch = 0; // will be changed to a legit char if we're going to use it here
+
+    switch (ev->type)
+    {
+        case ev_joystick_state:
+            if (menu_input == pad_mode && repeat != MENU_NULL
+                && joywait < I_GetTime())
+            {
+                action = repeat;
+                joywait = I_GetTime() + 2;
+            }
+            else
+            {
+                return true;
+            }
+            break;
+
+        case ev_joyb_down:
+            help_input = pad_mode;
+            menu_input = pad_mode;
+            break;
+
+        case ev_joyb_up:
+            if (M_InputDeactivated(input_menu_up)
+                || M_InputDeactivated(input_menu_down)
+                || M_InputDeactivated(input_menu_right)
+                || M_InputDeactivated(input_menu_left))
+            {
+                repeat = MENU_NULL;
+            }
+            return false;
+
+        case ev_keydown:
+            ch = ev->data1.i;
+            break;
+
+        case ev_text:
+            break;
+
+        case ev_keyup:
+            return false;
+
+        case ev_mouseb_down:
+            menu_input = mouse_mode;
+
+            if (MN_ContainerActive())
+            {
+                ResetMouseCursor();
+
+                mn_container_result_t result;
+
+                if (M_IsMouseWheel(ev->data1.i))
+                {
+                    result = MN_ContainerWheel(
+                        ev->data1.i == MOUSE_BUTTON_WHEELUP ? -1 : 1);
+                }
+                else
+                {
+                    MN_ContainerMouseMove(mouse_state_x, mouse_state_y);
+                    result = MN_ContainerMouseButton(ev->data1.i, true);
+                }
+
+                HandleContainerResult(result);
+                return true;
+            }
+
+            if (MouseResponder())
+            {
+                return true;
+            }
+            break;
+
+        case ev_mouseb_up:
+            if (MN_ContainerActive())
+            {
+                ResetMouseCursor();
+
+                mn_container_result_t result = MN_CONTAINER_HANDLED;
+
+                if (!M_IsMouseWheel(ev->data1.i))
+                {
+                    MN_ContainerMouseMove(mouse_state_x, mouse_state_y);
+                    result = MN_ContainerMouseButton(ev->data1.i, false);
+                }
+
+                HandleContainerResult(result);
+                return true;
+            }
+
+            if (menu_input == mouse_mode)
+            {
+                return MouseResponder();
+            }
+            return false;
+
+        case ev_mouse_state:
+            if (ev->data1.i == EV_RESIZE_VIEWPORT && menu_input != mouse_mode)
+            {
+                return true;
+            }
+            menu_input = mouse_mode;
+            mouse_state_x = (int)ev->data2.f;
+            mouse_state_y = (int)ev->data3.f;
+
+            if (MN_ContainerActive())
+            {
+                ResetMouseCursor();
+                MN_ContainerMouseMove(mouse_state_x, mouse_state_y);
+
+                if (ev->data1.i == EV_RESIZE_VIEWPORT)
+                {
+                    MN_ContainerRelayout();
+                }
+                return true;
+            }
+
+            CursorPosition();
+            MouseResponder();
+            return true;
+
+        default:
+            return false;
+    }
+
+    if (M_InputActivated(input_menu_up))
+    {
+        action = MENU_UP;
+    }
+    else if (M_InputActivated(input_menu_down))
+    {
+        action = MENU_DOWN;
+    }
+    else if (M_InputActivated(input_menu_left))
+    {
+        action = MENU_LEFT;
+    }
+    else if (M_InputActivated(input_menu_right))
+    {
+        action = MENU_RIGHT;
+    }
+    else if (M_InputActivated(input_menu_backspace))
+    {
+        action = MENU_BACKSPACE;
+    }
+    else if (M_InputActivated(input_menu_enter))
+    {
+        action = MENU_ENTER;
+    }
+    else if (M_InputActivated(input_menu_escape))
+    {
+        action = MENU_ESCAPE;
+    }
+    else if (M_InputActivated(input_menu_clear))
+    {
+        action = MENU_CLEAR;
+    }
+
+    if (ev->type == ev_joyb_down && action >= MENU_UP && action <= MENU_RIGHT)
+    {
+        repeat = action;
+        joywait = I_GetTime() + 15;
+    }
+
+    // These keys act on the highlighted item and must not switch the input
+    // mode, or the selection would jump to the keyboard cursor.
+    if (ev->type == ev_keydown && action != MENU_CLEAR
+        && action != MENU_ESCAPE && action != MENU_BACKSPACE)
+    {
+        help_input = key_mode;
+        menu_input = key_mode;
+    }
+
+    // Save Game string input
+
+    if (MN_SaveLoadTextInput(ev, action, ch))
+    {
+        return true;
+    }
+
+    // Menu text field input
+
+    if (MN_ContainerTextInput(ev, action, ch))
+    {
+        return true;
+    }
+
+    // Network game waiting screen
+
+    if (MP_Responder(action))
+    {
+        return true;
+    }
+
+    // Take care of any messages that need input
+
+    if (messageToPrint)
+    {
+        if (action == MENU_ENTER)
+        {
+            ch = 'y';
+        }
+
+        if (messageNeedsInput == true
+            && !(ch == ' ' || ch == 'n' || ch == 'y' || ch == key_escape
+                 || action == MENU_BACKSPACE)) // phares
+        {
+            return false;
+        }
+
+        menuactive = messageLastMenuActive;
+        messageToPrint = 0;
+        if (messageRoutine)
+        {
+            messageRoutine(ch);
+        }
+
+        I_SetSensorEventState(false);
+        G_ClearInput();
+        menuactive = false;
+        M_ResumeSound();
+        M_StartSound(sfx_mnucls);
+        return true;
+    }
+
+    // killough 2/22/98: add support for screenshot key:
+
+    if ((devparm && ch == key_help) || M_InputActivated(input_screenshot))
+    {
+        G_ScreenShot();
+        // return true; // [FG] don't let toggles eat keys
+    }
+
+    if (M_InputActivated(input_clean_screenshot))
+    {
+        clean_screenshot = true;
+        G_ScreenShot();
+    }
+
+    if (MN_ContainerActive())
+    {
+        ResetMouseCursor();
+        HandleContainerResult(MN_ContainerResponder(action, ch));
+        return true;
+    }
+
+    // Pop-up Main menu?
+
+    if (!menuactive)
+    {
+        if (!chat_on
+            && ((demoplayback
+                 && (action == MENU_ENTER || action == MENU_BACKSPACE))
+                || action == MENU_ESCAPE)) // phares
+        {
+            I_ShowMouseCursor(menu_input != pad_mode);
+            MN_StartControlPanel();
+            return true;
+        }
+        return false;
+    }
+
+    if (menuactive)
+    {
+        ResetMouseCursor();
+    }
+
+    // From here on, these navigation keys are used on the BIG FONT menus
+    // like the Main Menu.
+
+    if (action == MENU_DOWN) // phares 3/7/98
+    {
+        do
+        {
+            if (itemOn + 1 > currentMenu->numitems - 1)
+            {
+                itemOn = 0;
+            }
+            else
+            {
+                itemOn++;
+            }
+            M_StartSound(sfx_mnumov);
+        } while (currentMenu->menuitems[itemOn].status == -1);
+        return true;
+    }
+
+    if (action == MENU_UP) // phares 3/7/98
+    {
+        do
+        {
+            if (!itemOn)
+            {
+                itemOn = currentMenu->numitems - 1;
+            }
+            else
+            {
+                itemOn--;
+            }
+            M_StartSound(sfx_mnumov);
+        } while (currentMenu->menuitems[itemOn].status == -1);
+        return true;
+    }
+
+    if (action == MENU_LEFT) // phares 3/7/98
+    {
+        if (currentMenu->menuitems[itemOn].routine
+            && currentMenu->menuitems[itemOn].status == 2)
+        {
+            M_StartSound(sfx_mnusli);
+            currentMenu->menuitems[itemOn].routine(CHOICE_LEFT);
+        }
+        return true;
+    }
+
+    if (action == MENU_RIGHT) // phares 3/7/98
+    {
+        if (currentMenu->menuitems[itemOn].routine
+            && currentMenu->menuitems[itemOn].status == 2)
+        {
+            M_StartSound(sfx_mnusli);
+            currentMenu->menuitems[itemOn].routine(CHOICE_RIGHT);
+        }
+        return true;
+    }
+
+    if (action == MENU_ENTER) // phares 3/7/98
+    {
+        if (currentMenu->menuitems[itemOn].routine
+            && currentMenu->menuitems[itemOn].status)
+        {
+            currentMenu->lastOn = itemOn;
+            currentMenu->menuitems[itemOn].flags &= ~MF_HILITE;
+            if (currentMenu->menuitems[itemOn].status == 2)
+            {
+                currentMenu->menuitems[itemOn].routine(CHOICE_RIGHT);
+                M_StartSound(sfx_mnusli);
+            }
+            else
+            {
+                currentMenu->menuitems[itemOn].routine(itemOn);
+                M_StartSound(sfx_mnuact);
+            }
+        }
+        else
+        {
+            M_StartSound(sfx_mnuerr); // [FG] disabled menu item
+        }
+        // jff 3/24/98 remember last skill selected
+        //  killough 10/98 moved to skill-specific functions
+        return true;
+    }
+
+    if (action == MENU_ESCAPE) // phares 3/7/98
+    {
+        currentMenu->lastOn = itemOn;
+        M_ClearMenus();
+        M_StartSound(sfx_mnucls);
+        help_input = old_help_input;
+        menu_input = old_menu_input;
+        ResetMouseCursor();
+        return true;
+    }
+
+    if (action == MENU_BACKSPACE) // phares 3/7/98
+    {
+        menuitem_t *current_item = &currentMenu->menuitems[itemOn];
+        currentMenu->lastOn = itemOn;
+        current_item->flags &= ~MF_HILITE;
+
+        // phares 3/30/98:
+        // add checks to see if you're in the extended help screens
+        // if so, stay with the same menu definition, but bump the
+        // index back one. if the index bumps back far enough ( == 0)
+        // then you can return to the Read_Thisn menu definitions
+
+        if (currentMenu->prevMenu)
+        {
+            if (currentMenu == &ExtHelpDef)
+            {
+                if (--extended_help_index == 0)
+                {
+                    currentMenu = currentMenu->prevMenu;
+                    extended_help_index = 1; // reset
+                }
+            }
+            else
+            {
+                currentMenu = currentMenu->prevMenu;
+            }
+            itemOn = currentMenu->lastOn;
+            highlight_item = 0;
+            M_StartSound(sfx_mnubak);
+        }
+        else
+        {
+            M_ClearMenus();
+            M_StartSound(sfx_mnucls);
+        }
+        help_input = old_help_input;
+        menu_input = old_menu_input;
+        ResetMouseCursor();
+        return true;
+    }
+
+    if (ch) // fix items with alphaKey == 0
+    {
+        int i;
+
+        for (i = itemOn + 1; i < currentMenu->numitems; i++)
+        {
+            if (currentMenu->menuitems[i].alphaKey == ch)
+            {
+                itemOn = i;
+                M_StartSound(sfx_mnumov);
+                return true;
+            }
+        }
+
+        for (i = 0; i <= itemOn; i++)
+        {
+            if (currentMenu->menuitems[i].alphaKey == ch)
+            {
+                itemOn = i;
+                M_StartSound(sfx_mnumov);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+//
+// End of M_Responder
+//
+/////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// General Routines
+//
+// This displays the Main menu and gets the menu screens rolling.
+// Plus a variety of routines that control the Big Font menu display.
+// Plus some initialization for game-dependant situations.
+
+void MN_StartControlPanel(void)
+{
+    // intro might call this repeatedly
+
+    if (menuactive)
+    {
+        return;
+    }
+
+    // jff 3/24/98 make default skill menu choice follow -skill or defaultskill
+    // from command line or config file
+    //
+    //  killough 10/98:
+    //  Fix to make "always floating" with menu selections, and to always follow
+    //  defaultskill, instead of -skill.
+
+    InitializeSkillMenu();
+
+    menuactive = 1;
+    currentMenu = &MainDef;              // JDC
+    itemOn = currentMenu->lastOn;        // JDC
+    highlight_item = 0;
+    print_warning_about_changes = false; // killough 11/98
+
+    I_SetSensorEventState(true);
+    G_ClearInput();
+
+    M_PauseSound();
+    M_StartSound(sfx_mnuopn);
+}
+
+//
+// M_Drawer
+// Called after the view has been rendered,
+// but before it has been blitted.
+//
+// killough 9/29/98: Significantly reformatted source
+//
+
+boolean MN_MenuIsShaded(void)
+{
+    return (options_active || customskill_active)
+           && menu_backdrop == MENU_BG_DARK;
+}
+
+void M_Drawer(void)
+{
+    // Horiz. & Vertically center string and print it.
+    // killough 9/29/98: simplified code, removed 40-character width limit
+    if (messageToPrint)
+    {
+        // haleyjd 11/11/04: must strdup message, cannot write into
+        // string constants!
+        char *d = strdup(messageString);
+        char *p;
+        int y = 100 - MN_StringHeight(messageString) / 2;
+
+        p = d;
+
+        while (*p)
+        {
+            char *string = p, c;
+
+            while ((c = *p) && *p != '\n')
+            {
+                p++;
+            }
+            *p = 0;
+
+            WriteText(160 - MN_StringWidth(string) / 2, y, string);
+            y += SHORT(hu_font[0]->height);
+
+            if ((*p = c))
+            {
+                p++;
+            }
+        }
+
+        // haleyjd 11/11/04: free duplicate string
+        free(d);
+        return;
+    }
+
+    if (!menuactive)
+    {
+        return;
+    }
+
+    if (MN_MenuIsShaded())
+    {
+        V_ShadeScreen();
+    }
+
+    if (MN_ContainerActive())
+    {
+        MN_ContainerDrawer();
+        return;
+    }
+
+    if (currentMenu->routine)
+    {
+        currentMenu->routine(); // call Draw routine
+    }
+
+    // DRAW MENU
+
+    int x, y, max;
+
+    x = currentMenu->x;
+    y = currentMenu->y;
+    max = currentMenu->numitems;
+
+    // [FG] check current menu for missing menu graphics lumps - only once
+    if (currentMenu->lumps_missing == 0)
+    {
+        for (int i = 0; i < max; i++)
+        {
+            char *name = currentMenu->menuitems[i].name;
+            int patch_lump = -1;
+            int patch_priority = -1;
+
+            if (name[0])
+            {
+                patch_lump = W_CheckNumForName(name);
+                if (patch_lump >= 0)
+                {
+                    patch_priority = lumpinfo[patch_lump].handle.priority;
+                }
+                else
+                {
+                    name[0] = '\0';
+                }
+            }
+
+            if ((patch_lump < 0 || patch_priority < bigfont_priority)
+                && currentMenu->menuitems[i].alttext
+                && !(currentMenu->menuitems[i].flags & MF_OPTLUMP))
+            {
+                currentMenu->lumps_missing++;
+                break;
+            }
+        }
+
+        // [FG] no lump missing, no need to check again
+        if (currentMenu->lumps_missing == 0)
+        {
+            currentMenu->lumps_missing = -1;
+        }
+    }
+
+    for (int i = 0; i < max; ++i)
+    {
+        menuitem_t *item = &currentMenu->menuitems[i];
+
+        const char *alttext = item->alttext;
+        const char *name = item->name;
+
+        byte *cr;
+        if (item->status == 0)
+        {
+            cr = cr_dark;
+        }
+        else if (item->flags & MF_HILITE)
+        {
+            cr = xlat[CR_BRIGHT].table;
+        }
+        else
+        {
+            cr = NULL;
+        }
+
+        mrect_t *rect = &item->rect;
+        // due to the MainMenu[] hacks, we have to set `y` here
+        rect->y = y;
+
+        // [FG] at least one menu graphics lump is missing, draw alternative
+        // text
+        if (currentMenu->lumps_missing > 0
+            || (!name[0] && item->flags & MF_OPTLUMP))
+        {
+            if (alttext)
+            {
+                if (!MN_DrawFon2String(x, y, cr, alttext))
+                {
+                    MN_DrawStringCR(x, y + 8 - MN_StringHeight(alttext) / 2, cr,
+                                    NULL, alttext);
+                }
+            }
+        }
+        else if (name[0])
+        {
+            patch_t *patch = V_CachePatchName(name, PU_CACHE);
+            rect->y -= SHORT(patch->topoffset);
+            V_DrawPatchTranslated(x, y, patch, cr);
+        }
+
+        y += LINEHEIGHT;
+    }
+
+    // DRAW SKULL
+
+    y = currentMenu->y;
+
+    V_DrawPatch(x + SKULLXOFF, y - 5 + itemOn * LINEHEIGHT,
+                V_CachePatchName(skullName[whichSkull], PU_CACHE));
+}
+
+/////////////////////////////
+//
+// Message Routines
+//
+
+void M_StartMessage(const char *string, void (*routine)(int), boolean input)
+{
+    messageLastMenuActive = menuactive;
+    messageToPrint = 1;
+    messageString = string;
+    messageRoutine = routine;
+    messageNeedsInput = input;
+    menuactive = true;
+    return;
+}
+
+/////////////////////////////
+//
+// Thermometer Routines
+//
+
+//
+// M_DrawThermo draws the thermometer graphic for Mouse Sensitivity,
+// Sound Volume, etc.
+//
+static void M_DrawThermo(int x, int y, int thermWidth, int thermDot, byte *cr)
+{
+    int xx;
+    int i;
+    char num[4];
+
+    xx = x;
+    V_DrawPatchTranslated(xx, y, V_CachePatchName("M_THERML", PU_CACHE), cr);
+    xx += 8;
+    for (i = 0; i < thermWidth; i++)
+    {
+        V_DrawPatchTranslated(xx, y, V_CachePatchName("M_THERMM", PU_CACHE), cr);
+        xx += 8;
+    }
+    V_DrawPatchTranslated(xx, y, V_CachePatchName("M_THERMR", PU_CACHE), cr);
+
+    // [FG] write numerical values next to thermometer
+    M_snprintf(num, 4, "%3d", thermDot);
+    WriteText(xx + 8, y + 3, num);
+
+    // [FG] do not crash anymore if value exceeds thermometer range
+    if (thermDot >= thermWidth)
+    {
+        thermDot = thermWidth - 1;
+    }
+
+    V_DrawPatchTranslated((x + 8) + thermDot * 8, y,
+                          V_CachePatchName("M_THERMO", PU_CACHE), cr);
+}
+
+//
+//    Write a string using the hu_font
+//
+
+static void WriteTextCR(int x, int y, byte *cr, const char *string)
+{
+    int w;
+    const char *ch;
+    int c;
+    int cx;
+    int cy;
+
+    ch = string;
+    cx = x;
+    cy = y;
+
+    while (1)
+    {
+        c = *ch++;
+        if (!c)
+        {
+            break;
+        }
+        if (c == '\n')
+        {
+            cx = x;
+            cy += 12;
+            continue;
+        }
+
+        c = M_ToUpper(c) - HU_FONTSTART;
+        if (c < 0 || c >= HU_FONTSIZE || hu_font[c] == NULL)
+        {
+            cx += 4;
+            continue;
+        }
+
+        w = SHORT(hu_font[c]->width);
+        if (cx + w > SCREENWIDTH + video.deltaw)
+        {
+            break;
+        }
+
+        if (cr)
+        {
+            V_DrawPatchTranslated(cx, cy, hu_font[c], cr);
+        }
+        else
+        {
+            V_DrawPatch(cx, cy, hu_font[c]);
+        }
+
+        cx += w;
+    }
+}
+
+static void WriteText(int x, int y, const char *string)
+{
+    WriteTextCR(x, y, NULL, string);
+}
+
+void MN_DrawTitle(int x, int y, const char *patch, const char *alttext)
+{
+    int patch_lump = W_CheckNumForName(patch);
+    int patch_priority = -1;
+
+    if (patch_lump >= 0)
+    {
+        patch_priority = lumpinfo[patch_lump].handle.priority;
+    }
+
+    if (patch_lump >= 0 && patch_priority >= bigfont_priority)
+    {
+        patch_t *patch = V_CachePatchNum(patch_lump, PU_CACHE);
+        V_DrawPatch(x == M_X_CENTER ? SCREENWIDTH / 2 - patch->width / 2 : x, y,
+                    patch);
+    }
+    else
+    {
+        // patch doesn't exist, draw some text in place of it
+        if (!MN_DrawFon2String((SCREENWIDTH - MN_GetFon2PixelWidth(alttext)) / 2,
+                               y, NULL, alttext))
+        {
+            MN_DrawString((SCREENWIDTH - MN_GetPixelWidth(alttext)) / 2,
+                          y + 8 - MN_StringHeight(alttext) / 2, // assumes patch height 16
+                          CR_GOLD, alttext);
+        }
+    }
+}
+
+void M_StartSound(int sound_id)
+{
+    S_StartSoundPitch(NULL, sound_id, PITCH_NONE);
+}
+
+//----------------------------------------------------------------------------
+//
+// $Log: m_menu.c,v $
+// Revision 1.54  1998/05/28  05:27:13  killough
+// Fix some load / save / end game handling r.w.t. demos
+//
+// Revision 1.53  1998/05/16  09:17:09  killough
+// Make loadgame checksum friendlier
+//
+// Revision 1.52  1998/05/05  15:34:55  phares
+// Documentation and Reformatting changes
+//
+// Revision 1.51  1998/05/03  21:55:58  killough
+// Provide minimal required headers and decls
+//
+// Revision 1.50  1998/05/01  21:35:06  killough
+// Fix status bar update after leaving help screens
+//
+// Revision 1.49  1998/04/24  23:51:51  thldrmn
+// Reinstated gamma correction deh variables
+//
+// Revision 1.48  1998/04/23  13:07:05  jim
+// Add exit line to automap
+//
+// Revision 1.47  1998/04/22  13:46:02  phares
+// Added Setup screen Reset to Defaults
+//
+// Revision 1.46  1998/04/19  01:19:42  killough
+// Tidy up last fix's code
+//
+// Revision 1.45  1998/04/17  14:46:33  killough
+// fix help showstopper
+//
+// Revision 1.44  1998/04/17  10:28:46  killough
+// Add traditional_menu
+//
+// Revision 1.43  1998/04/14  11:29:50  phares
+// Added demorecording as a condition for delaying config change
+//
+// Revision 1.42  1998/04/14  10:55:24  phares
+// Recoil, Bobbing, Monsters Remember changes in Setup now take effect
+// immediately
+//
+// Revision 1.41  1998/04/13  21:36:24  phares
+// Cemented ESC and F1 in place
+//
+// Revision 1.40  1998/04/12  22:55:23  phares
+// Remaining 3 Setup screens
+//
+// Revision 1.39  1998/04/06  05:01:04  killough
+// set inhelpscreens=true for status bar update, rearrange menu yet again
+//
+// Revision 1.38  1998/04/05  00:50:59  phares
+// Joystick support, Main Menu re-ordering
+//
+// Revision 1.37  1998/04/03  19:18:31  phares
+// Automap Palette work, slot 0 = disable, 247 = BLACK
+//
+// Revision 1.36  1998/04/03  14:45:28  jim
+// Fixed automap disables at 0, mouse sens unbounded
+//
+// Revision 1.35  1998/04/01  15:34:09  phares
+// Added Automap Setup Screen, fixed Seg Viol in Setup Menus
+//
+// Revision 1.34  1998/03/31  23:07:40  phares
+// Fixed bug in key binding screen causing seg viol
+//
+// Revision 1.33  1998/03/31  10:40:06  killough
+// Fix incorrect order of quit message
+//
+// Revision 1.32  1998/03/31  01:07:59  phares
+// Initial Setup screens and Extended HELP screens
+//
+// Revision 1.31  1998/03/28  05:32:25  jim
+// Text enabling changes for DEH
+//
+// Revision 1.30  1998/03/24  15:59:36  jim
+// Added default_skill parameter to config file
+//
+// Revision 1.29  1998/03/23  15:21:24  phares
+// Start of setup menus
+//
+// Revision 1.28  1998/03/23  03:22:00  killough
+// Use G_SaveGameName for consistent savegame naming
+//
+// Revision 1.27  1998/03/16  12:31:11  killough
+// Remember savegame slot when loading
+//
+// Revision 1.26  1998/03/15  14:41:15  jim
+// added two more save/load slots
+//
+// Revision 1.25  1998/03/11  17:48:10  phares
+// New cheats, clean help code, friction fix
+//
+// Revision 1.24  1998/03/10  07:07:25  jim
+// Fixed display glitch in HUD cycle
+//
+// Revision 1.23  1998/03/09  18:29:06  phares
+// Created separately bound automap and menu keys
+//
+// Revision 1.22  1998/03/09  07:36:45  killough
+// Some #ifdef'ed help screen fixes, saved autorun status
+//
+// Revision 1.21  1998/03/05  11:29:26  jim
+// Fixed mis-merge in m_menu.c
+//
+// Revision 1.20  1998/03/05  01:12:34  jim
+// Added distributed hud to key_hud function
+//
+// Revision 1.19  1998/03/04  22:15:51  phares
+// Included missing externs
+//
+// Revision 1.18  1998/03/04  21:02:20  phares
+// Dynamic HELP screen
+//
+// Revision 1.17  1998/03/04  11:54:56  jim
+// Fix fullscreen bug in F5 key
+//
+// Revision 1.16  1998/03/02  15:34:06  jim
+// Added Rand's HELP screen as lump and loaded and displayed it
+//
+// Revision 1.15  1998/02/24  10:52:13  jim
+// Fixed missing changes in m_menu.c
+//
+// Revision 1.14  1998/02/24  09:13:01  phares
+// Corrected key_detail->key_hud oversight
+//
+// Revision 1.13  1998/02/24  08:46:00  phares
+// Pushers, recoil, new friction, and over/under work
+//
+// Revision 1.12  1998/02/24  04:14:08  jim
+// Added double keys to status
+//
+// Revision 1.11  1998/02/23  14:21:04  jim
+// Merged HUD stuff, fixed p_plats.c to support elevators again
+//
+// Revision 1.10  1998/02/23  04:35:44  killough
+// Fix help screens and broken HUD control
+//
+// Revision 1.8  1998/02/19  16:54:40  jim
+// Optimized HUD and made more configurable
+//
+// Revision 1.7  1998/02/18  11:56:03  jim
+// Fixed issues with HUD and reduced screen size
+//
+// Revision 1.5  1998/02/17  06:11:59  killough
+// Support basesavegame path to savegames
+//
+// Revision 1.4  1998/02/15  02:47:50  phares
+// User-defined keys
+//
+// Revision 1.3  1998/02/02  13:38:15  killough
+// Add mouse sensitivity menu bar lumps
+//
+// Revision 1.2  1998/01/26  19:23:47  phares
+// First rev with no ^Ms
+//
+// Revision 1.1.1.1  1998/01/19  14:02:58  rand
+// Lee's Jan 19 sources
+//
+//----------------------------------------------------------------------------
+
+#ifdef __ANDROID__
+// Android port: the touch overlay shows Y/N buttons only while a message
+// is waiting for an answer.
+int MN_AndroidContainerConfirm(void);
+
+int MN_AndroidAwaitingInput(void)
+{
+    if (!menuactive)
+    {
+        return 0;
+    }
+    return (messageToPrint && messageNeedsInput) || MN_AndroidContainerConfirm();
+}
+#endif

@@ -1,0 +1,16 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <!-- Same light launcher in dark mode (dark variant is not designed yet) -->
+  <style name="Base.AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
+    <item name="colorPrimary">#E58744</item>
+    <item name="colorPrimaryDark">#C46A2C</item>
+    <item name="colorAccent">#E58744</item>
+    <item name="android:windowBackground">#FFFFFF</item>
+    <item name="android:statusBarColor">#FFFFFF</item>
+    <item name="android:windowLightStatusBar" tools:targetApi="23">true</item>
+    <item name="android:textColorPrimary">#000000</item>
+    <item name="android:textColorSecondary">#000000</item>
+    <item name="android:textColorHint">#6B6B6B</item>
+  </style>
+
+  <style name="AppTheme" parent="Base.AppTheme" />
+</resources>
