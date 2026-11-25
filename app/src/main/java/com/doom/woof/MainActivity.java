@@ -4,8 +4,13 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.Settings;
 import android.provider.OpenableColumns;
 import android.view.View;
 import android.widget.ArrayAdapter;
@@ -24,7 +29,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,12 +47,16 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_IWAD = "iwad";
     private static final String PREF_ARGS = "extra_args";
     private static final String PREF_ADDONS = "addons";
+    private static final String PREF_DEMO = "demo";
+    private static final String DEMO_RECORD = "@record";
+    private static final String DEMO_DIR_NAME = "WOOFLMP";
 
     private ActivityMainBinding binding;
     private SharedPreferences prefs;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
 
     private File wadsDir;
+    private String demoChoice = "";
     private final ArrayList<File> iwads = new ArrayList<>();
     private final ArrayList<File> addons = new ArrayList<>();
     private final ArrayList<File> selectedAddons = new ArrayList<>();
@@ -74,7 +85,9 @@ public class MainActivity extends AppCompatActivity {
         binding.buttonAddons.setOnClickListener(v -> chooseAddons());
         binding.buttonControls.setOnClickListener(
                 v -> startActivity(new Intent(this, ControlsEditorActivity.class)));
+        binding.buttonDemo.setOnClickListener(v -> chooseDemo());
         binding.buttonPlay.setOnClickListener(v -> play());
+        demoChoice = prefs.getString(PREF_DEMO, "");
 
         // The game needs woof.pk3 before it starts: put it in the internal files dir (where Woof looks for it).
         io.execute(() -> {
@@ -178,6 +191,7 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         updateAddonsText();
+        updateDemoText();
 
         boolean have = !iwads.isEmpty();
         binding.buttonPlay.setEnabled(have);
@@ -230,6 +244,108 @@ public class MainActivity extends AppCompatActivity {
             }
             binding.textAddons.setText(sb);
         }
+    }
+
+    // ------------------------------------------------------------ demos
+
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestStorageAccess() {
+        Toast.makeText(this, R.string.demo_need_access, Toast.LENGTH_LONG).show();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            try {
+                startActivity(intent);
+            } catch (RuntimeException e) {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            }
+        } else {
+            requestPermissions(new String[] { Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                    Manifest.permission.READ_EXTERNAL_STORAGE }, 1);
+        }
+    }
+
+    /** WOOFLMP on the sdcard when we may write there, otherwise a folder owned by the app. */
+    private File demoDir() {
+        File dir;
+        if (hasStorageAccess()) {
+            dir = new File(Environment.getExternalStorageDirectory(), DEMO_DIR_NAME);
+        } else {
+            File ext = getExternalFilesDir(DEMO_DIR_NAME);
+            dir = ext != null ? ext : new File(getFilesDir(), DEMO_DIR_NAME);
+        }
+        //noinspection ResultOfMethodCallIgnored
+        dir.mkdirs();
+        return dir;
+    }
+
+    private File[] demoFiles() {
+        File[] files = demoDir().listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".lmp"));
+        if (files == null) {
+            return new File[0];
+        }
+        Arrays.sort(files, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        return files;
+    }
+
+    private void chooseDemo() {
+        if (!hasStorageAccess()) {
+            requestStorageAccess();
+        }
+        File[] files = demoFiles();
+        String[] items = new String[files.length + 2];
+        items[0] = getString(R.string.demo_off);
+        items[1] = getString(R.string.demo_record);
+        int checked = 0;
+        if (DEMO_RECORD.equals(demoChoice)) {
+            checked = 1;
+        }
+        for (int i = 0; i < files.length; i++) {
+            items[i + 2] = files[i].getName();
+            if (files[i].getName().equals(demoChoice)) {
+                checked = i + 2;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.demo_title)
+                .setSingleChoiceItems(items, checked, (d, which) -> {
+                    demoChoice = which == 0 ? "" : which == 1 ? DEMO_RECORD : files[which - 2].getName();
+                    prefs.edit().putString(PREF_DEMO, demoChoice).apply();
+                    updateDemoText();
+                    d.dismiss();
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void updateDemoText() {
+        String dir = demoDir().getAbsolutePath();
+        if (DEMO_RECORD.equals(demoChoice)) {
+            binding.textDemo.setText(getString(R.string.demo_record_summary, dir));
+        } else if (!demoChoice.isEmpty() && new File(demoDir(), demoChoice).isFile()) {
+            binding.textDemo.setText(getString(R.string.demo_play_summary, demoChoice));
+        } else {
+            demoChoice = "";
+            binding.textDemo.setText(R.string.demo_off);
+        }
+    }
+
+    private static boolean hasArg(String extra, String... names) {
+        for (String t : extra.split("\\s+")) {
+            for (String n : names) {
+                if (t.equals(n)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------ import
@@ -314,9 +430,39 @@ public class MainActivity extends AppCompatActivity {
         if (!extra.isEmpty()) {
             args.addAll(Arrays.asList(extra.split("\\s+")));
         }
+        addDemoArgs(args, extra);
 
         Intent intent = new Intent(this, GameActivity.class);
         intent.putExtra(GameActivity.EXTRA_ARGS, args.toArray(new String[0]));
         startActivity(intent);
+    }
+
+    /** Adds -record or -playdemo unless the extra arguments already ask for a demo. */
+    private void addDemoArgs(ArrayList<String> args, String extra) {
+        if (hasArg(extra, "-record", "-recordfrom", "-recordfromto", "-playdemo", "-timedemo",
+                "-fastdemo")) {
+            return;
+        }
+        File dir = demoDir();
+        if (DEMO_RECORD.equals(demoChoice)) {
+            // Woof refuses to record without a complevel and a skill.
+            if (!hasArg(extra, "-complevel")) {
+                args.add("-complevel");
+                args.add("mbf21");
+            }
+            if (!hasArg(extra, "-skill", "-uv", "-nm")) {
+                args.add("-skill");
+                args.add("4");
+            }
+            String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
+            args.add("-record");
+            args.add(new File(dir, "demo-" + stamp).getAbsolutePath());
+        } else if (!demoChoice.isEmpty()) {
+            File f = new File(dir, demoChoice);
+            if (f.isFile()) {
+                args.add("-playdemo");
+                args.add(f.getAbsolutePath());
+            }
+        }
     }
 }

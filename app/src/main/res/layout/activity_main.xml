@@ -112,6 +112,35 @@
                     android:textSize="16sp" />
             </LinearLayout>
 
+            <!-- Demos (LMP) -->
+            <LinearLayout
+                android:id="@+id/buttonDemo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:minHeight="56dp"
+                android:orientation="vertical"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp">
+
+                <TextView
+                    style="@style/Caption"
+                    android:text="@string/demo_title" />
+
+                <TextView
+                    android:id="@+id/textDemo"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:ellipsize="end"
+                    android:maxLines="2"
+                    android:text="@string/demo_off"
+                    android:textColor="#000000"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
             <EditText
                 android:id="@+id/editArgs"
                 android:layout_width="match_parent"

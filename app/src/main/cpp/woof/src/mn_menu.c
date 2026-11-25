@@ -42,6 +42,7 @@
 #include "i_system.h"
 #include "i_timer.h"
 #include "i_video.h"
+#include "m_config.h"
 #include "m_input.h"
 #include "m_misc.h"
 #include "m_swap.h"
@@ -1254,6 +1255,11 @@ static void M_ClearMenus(void)
     I_SetSensorEventState(false);
     G_ClearInput();
     M_ResumeSound();
+
+#ifdef __ANDROID__
+    // The process can be killed without running the exit handlers.
+    M_SaveDefaults();
+#endif
 }
 
 void MN_CloseMenu(void)

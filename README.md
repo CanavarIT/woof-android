@@ -12,7 +12,7 @@
 
 # Woof! for Android
 
-An Android port of [Woof!](https://github.com/fabiangreffrath/woof), the Doom source port by Fabian Greffrath and contributors. It runs the unmodified Woof engine and adds a launcher and touch controls around it.
+An Android port of [Woof!](https://github.com/fabiangreffrath/woof), the Doom source port by Fabian Greffrath and contributors. It runs the Woof engine with a few small Android hooks and adds a launcher and touch controls around it.
 
 You need to provide your own game data (IWAD). None is included.
 
@@ -24,6 +24,10 @@ You need to provide your own game data (IWAD). None is included.
 - Minimal touch controls with an in-app layout editor
 - Touch mode for menus: a tap is a mouse click, Y/N buttons appear when the game asks a question
 - Gamepad and keyboard work through SDL
+- Demo recording and playback (LMP files in `WOOFLMP` on the sdcard)
+- On-screen keyboard for number and text fields in the menus
+- Settings are saved when the menu is closed or the app goes to the background
+- Separate save game folder for every WAD (`savegames/<wad name>/`)
 - Multiplayer through SDL3_net
 
 ## Requirements
@@ -71,6 +75,10 @@ In menus, title screens and intermissions the buttons are hidden and the screen 
 
 Settings are stored in `SharedPreferences` (`woof_controls`).
 
+### Demos
+
+Tap **Demo** in the launcher and choose **Record new demo** or an existing `.lmp` file. Recorded demos are saved to `WOOFLMP` on the sdcard when the app has all files access, otherwise to `Android/data/com.doom.woof/files/WOOFLMP`. A demo is written when you leave the game through the menu. Play it back with the same IWAD and add-ons it was recorded with. Recording uses `-complevel mbf21 -skill 4` unless the extra arguments set their own.
+
 ## Building
 
 Requirements: Android Studio with SDK 36, NDK `29.0.14033849` and CMake `3.31.6`.
@@ -115,7 +123,7 @@ app/src/main
 - `woof.pk3` is copied to the app's internal files directory, which is where Woof looks for it on Android.
 - The game runs in a separate process (`:game`). Woof quits with `exit()`, which must not take the launcher down.
 - `TouchControlsView` sits on top of the SDL surface and feeds the game through `SDLActivity.onNativeKeyDown/Up` and `onNativeMouse`.
-- It asks the engine about its state through one JNI call (`nativeUiState`): menu active, autorun on, Y/N question open. Two small hooks were added to Woof for this (`mn_menu.c`, `mn_container.c`, guarded by `__ANDROID__`).
+- It asks the engine about its state through one JNI call (`nativeUiState`): menu active, autorun on, Y/N question open. Small hooks were added to Woof for this (`mn_menu.c`, `mn_container.c`, `mn_options.c`, guarded by `__ANDROID__`).
 - Audio goes through OpenAL Soft with the OpenSL ES backend.
 
 ## Limitations

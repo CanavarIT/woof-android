@@ -233,6 +233,7 @@ static void NumberCommit(mn_item_t *item)
 
     item->gathering = false;
     item->gather_count = 0;
+    I_StopTextInput();
     MN_ContainerEndEdit();
 }
 
@@ -245,6 +246,7 @@ static boolean NumberRespond(mn_item_t *item, menu_action_t action, int ch)
             item->gathering = true;
             item->gather_count = 0;
             item->gather[0] = '\0';
+            I_StartTextInput();
         }
         else
         {
@@ -262,6 +264,7 @@ static boolean NumberRespond(mn_item_t *item, menu_action_t action, int ch)
     {
         item->gathering = false;
         item->gather_count = 0;
+        I_StopTextInput();
         MN_ContainerEndEdit();
         return true;
     }
@@ -275,11 +278,13 @@ static boolean NumberRespond(mn_item_t *item, menu_action_t action, int ch)
         else
         {
             item->gathering = false;
+            I_StopTextInput();
             MN_ContainerEndEdit();
         }
         return true;
     }
 
+#ifndef __ANDROID__
     if ((ch >= '0' && ch <= '9') || (ch == '-' && item->gather_count == 0))
     {
         if (item->gather_count < (int)sizeof(item->gather) - 1)
@@ -288,9 +293,50 @@ static boolean NumberRespond(mn_item_t *item, menu_action_t action, int ch)
             item->gather[item->gather_count] = '\0';
         }
     }
+#endif
 
     return true;
 }
+
+#ifdef __ANDROID__
+// On Android the digits come from the on-screen keyboard as text events,
+// while the key events for the same digits are swallowed to avoid typing
+// every digit twice.
+static boolean NumberInput(mn_item_t *item, const struct event_s *ev,
+                           menu_action_t action, int ch)
+{
+    if (!item->gathering)
+    {
+        return false;
+    }
+
+    int chr = 0;
+
+    if (ev->type == ev_text)
+    {
+        chr = ev->data1.i;
+    }
+    else if (ev->type == ev_keydown && ((ch >= '0' && ch <= '9') || ch == '-'))
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+
+    if ((chr >= '0' && chr <= '9') || (chr == '-' && item->gather_count == 0))
+    {
+        if (item->gather_count < (int)sizeof(item->gather) - 1)
+        {
+            item->gather[item->gather_count++] = chr;
+            item->gather[item->gather_count] = '\0';
+        }
+    }
+
+    return true;
+}
+#endif
 
 enum
 {
@@ -1153,7 +1199,12 @@ static boolean InputClick(mn_item_t *item, int x, int y)
 
 static const mn_item_ops_t title_ops = {TitleDraw, TitleRespond};
 static const mn_item_ops_t toggle_ops = {ToggleDraw, ToggleRespond};
+#ifdef __ANDROID__
+static const mn_item_ops_t number_ops = {NumberDraw, NumberRespond,
+                                         .text = NumberInput};
+#else
 static const mn_item_ops_t number_ops = {NumberDraw, NumberRespond};
+#endif
 static const mn_item_ops_t choice_ops = {ChoiceDrawCrosshair, ChoiceRespond,
     .click = ChoiceClick, .hover = ChoiceHover
 };

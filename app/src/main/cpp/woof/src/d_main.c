@@ -1505,6 +1505,10 @@ void D_SetSavegameDirectory(void)
     }
     else
     {
+#ifdef __ANDROID__
+        // Every WAD gets its own folder for save games.
+        organize_savefiles = 1;
+#endif
         if (organize_savefiles == -1)
         {
             // [FG] check for at least one savegame in the old location

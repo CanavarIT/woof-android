@@ -22,4 +22,10 @@
     <string name="opt_size">Button size</string>
     <string name="opt_opacity">Opacity</string>
     <string name="opt_look">Look sensitivity</string>
+    <string name="demo_title">Demo</string>
+    <string name="demo_off">Off</string>
+    <string name="demo_record">Record new demo</string>
+    <string name="demo_record_summary">Record a new demo to %1$s</string>
+    <string name="demo_play_summary">Play %1$s</string>
+    <string name="demo_need_access">Allow access to all files so Woof can use the WOOFLMP folder on the sdcard</string>
 </resources>

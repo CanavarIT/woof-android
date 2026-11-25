@@ -555,6 +555,15 @@ static void ProcessEvent(SDL_Event *ev)
             }
             break;
 
+#ifdef __ANDROID__
+        // The system may kill the process while it is in the background,
+        // so the settings are written as soon as the app is left.
+        case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        case SDL_EVENT_TERMINATING:
+            M_SaveDefaults();
+            break;
+#endif
+
         case SDL_EVENT_QUIT:
             fast_exit = true;
             I_SafeExit(0);
